@@ -154,13 +154,20 @@ enum Commands {
     },
 }
 
-async fn find_available_port(start_port: u16) -> (tokio::net::TcpListener, u16) {
+async fn find_available_port(bind_ip: Option<std::net::Ipv4Addr>, start_port: u16) -> (tokio::net::TcpListener, u16) {
     let mut actual_port = start_port;
+    let ip = bind_ip.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
     loop {
-        let addr = format!("0.0.0.0:{}", actual_port);
+        let addr = std::net::SocketAddr::from((ip, actual_port));
         match tokio::net::TcpListener::bind(&addr).await {
-            Ok(listener) => return (listener, actual_port),
+            Ok(listener) => {
+                let port = listener.local_addr().map(|a| a.port()).unwrap_or(actual_port);
+                return (listener, port);
+            }
             Err(e) => {
+                if start_port == 0 {
+                    panic!("Failed to bind to auto-allocated port: {}", e);
+                }
                 println!(
                     "Port {} is occupied (error: {}). Trying next port...",
                     actual_port, e
@@ -289,7 +296,8 @@ async fn main() {
                 &env_config,
                 &app_config,
             );
-            let (listener, actual_port) = find_available_port(settings.port).await;
+            let bind_ip = parse_bind_ip(settings.bind_ip.as_deref());
+            let (listener, actual_port) = find_available_port(bind_ip, settings.port).await;
 
             let node_name = match settings.name {
                 Some(n) => n,
@@ -298,8 +306,6 @@ async fn main() {
                     .and_then(|h| h.into_string().ok())
                     .unwrap_or_else(|| "Unknown-Node".to_string()),
             };
-
-            let bind_ip = parse_bind_ip(settings.bind_ip.as_deref());
 
             let registry = lan_share::peer::PeerRegistry::new();
 
@@ -741,5 +747,14 @@ mod tests {
             resolve_destination("127.0.0.1", None).await,
             "127.0.0.1:8080"
         );
+    }
+
+    #[tokio::test]
+    async fn test_find_available_port_with_loopback() {
+        let loopback_ip = Some(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        let (listener, actual_port) = find_available_port(loopback_ip, 0).await;
+        assert!(actual_port > 0, "自动分配的端口应大于 0");
+        let local_addr = listener.local_addr().unwrap();
+        assert_eq!(local_addr.ip().to_string(), "127.0.0.1", "监听地址应仅为 127.0.0.1，而不是 0.0.0.0");
     }
 }
