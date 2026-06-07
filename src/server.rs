@@ -91,7 +91,7 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
 
-            let mut dirs_to_remove = Vec::new();
+            let mut paths_to_remove = Vec::new();
             {
                 let mut map = sessions.lock().await;
                 let now = std::time::Instant::now();
@@ -105,13 +105,20 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
 
                 for id in stale_ids {
                     if let Some(session) = map.remove(&id) {
-                        dirs_to_remove.push(session.temp_dir);
+                        paths_to_remove.push((session.temp_dir, session.final_path));
                     }
                 }
             } // 锁在这里释放
 
-            for dir in dirs_to_remove {
-                let _ = tokio::fs::remove_dir_all(&dir).await;
+            for (temp_dir, final_path) in paths_to_remove {
+                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+                if final_path.exists() {
+                    if let Ok(metadata) = tokio::fs::metadata(&final_path).await {
+                        if metadata.len() == 0 {
+                            let _ = tokio::fs::remove_file(&final_path).await;
+                        }
+                    }
+                }
             }
         }
     });
@@ -233,7 +240,10 @@ async fn handle_file(
                 }
             };
 
-            let final_path = available_download_path(&state.download_dir, basename);
+            let final_path = match reserve_download_path(&state, basename).await {
+                Ok(path) => path,
+                Err(status) => return status.into_response(),
+            };
             let temp_path = temp_upload_path(&state.download_dir, basename);
             match save_upload_field(field, &temp_path, &final_path, &checksum, &file_encoding).await
             {
@@ -243,10 +253,12 @@ async fn handle_file(
                 }
                 Err(UploadError::BadRequest(message)) => {
                     eprintln!("{}", message);
+                    let _ = tokio::fs::remove_file(&final_path).await;
                     return StatusCode::BAD_REQUEST.into_response();
                 }
                 Err(UploadError::Io(e)) => {
                     eprintln!("Failed to save uploaded file: {}", e);
+                    let _ = tokio::fs::remove_file(&final_path).await;
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
             }
@@ -316,10 +328,14 @@ async fn handle_file_init(
         }
     }
 
-    let final_path = available_download_path(&state.download_dir, &basename);
+    let final_path = match reserve_download_path(&state, &basename).await {
+        Ok(path) => path,
+        Err(status) => return status.into_response(),
+    };
     let temp_dir = chunk_upload_dir(&state.download_dir, &basename, &upload_id);
     if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
         eprintln!("Failed to create upload temp directory: {}", e);
+        let _ = tokio::fs::remove_file(&final_path).await;
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -328,12 +344,14 @@ async fn handle_file_init(
             Ok(chunks) => chunks,
             Err(e) => {
                 eprintln!("Failed to scan upload temp directory: {}", e);
+                let _ = tokio::fs::remove_file(&final_path).await;
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
 
     let mut sessions = state.upload_sessions.lock().await;
     let session = if let Some(mut existing) = sessions.get(&upload_id).cloned() {
+        let _ = tokio::fs::remove_file(&final_path).await;
         if existing.file_size != payload.file_size
             || existing.chunk_size != payload.chunk_size
             || existing.checksum != payload.checksum
@@ -461,31 +479,35 @@ impl From<io::Error> for UploadError {
     }
 }
 
-fn available_download_path(download_dir: &Path, basename: &str) -> PathBuf {
-    let original_path = Path::new(basename);
-    let stem = original_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    let extension = original_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
 
+async fn reserve_download_path(state: &ServerState, basename: &str) -> Result<PathBuf, StatusCode> {
+    let original_path = Path::new(basename);
+    let stem = original_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let extension = original_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let mut counter = 0;
     loop {
         let candidate = if counter == 0 {
-            download_dir.join(basename)
+            state.download_dir.join(basename)
         } else if extension.is_empty() {
-            download_dir.join(format!("{}_{}", stem, counter))
+            state.download_dir.join(format!("{}_{}", stem, counter))
         } else {
-            download_dir.join(format!("{}_{}.{}", stem, counter, extension))
+            state.download_dir.join(format!("{}_{}.{}", stem, counter, extension))
         };
-
-        if !candidate.exists() {
-            return candidate;
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
+            Ok(_) => return Ok(candidate),
+            Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                counter += 1;
+            }
+            Err(e) => {
+                eprintln!("Failed to create placeholder file: {}", e);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
         }
-        counter += 1;
     }
 }
 
@@ -1122,10 +1144,13 @@ mod tests {
         
         let session_dir = tmp_dir.path().join(".dummy.chunks-stale-id");
         tokio::fs::create_dir_all(&session_dir).await.unwrap();
+        let dummy_path = tmp_dir.path().join("dummy.txt");
+        tokio::fs::File::create(&dummy_path).await.unwrap();
+        assert!(dummy_path.exists());
         
         let stale_session = UploadSession {
             sender_name: "stale-user".to_string(),
-            final_path: tmp_dir.path().join("dummy.txt"),
+            final_path: dummy_path.clone(),
             temp_dir: session_dir.clone(),
             file_size: 1000,
             chunk_size: 100,
@@ -1147,14 +1172,28 @@ mod tests {
             .map(|(id, _)| id.clone())
             .collect();
             
+        let mut paths_to_remove = Vec::new();
         for id in stale_ids {
             if let Some(session) = map.remove(&id) {
-                let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
+                paths_to_remove.push((session.temp_dir, session.final_path));
+            }
+        }
+        drop(map);
+        
+        for (temp_dir, final_path) in paths_to_remove {
+            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+            if final_path.exists() {
+                if let Ok(metadata) = tokio::fs::metadata(&final_path).await {
+                    if metadata.len() == 0 {
+                        let _ = tokio::fs::remove_file(&final_path).await;
+                    }
+                }
             }
         }
         
-        assert!(!map.contains_key("stale-id"));
+        assert!(!upload_sessions.lock().await.contains_key("stale-id"));
         assert!(!session_dir.exists(), "过期的隐藏临时文件夹应该已被彻底删除");
+        assert!(!dummy_path.exists(), "过期的隐藏临时占位文件应该已被彻底删除");
     }
 
     #[tokio::test]
@@ -1200,6 +1239,57 @@ mod tests {
         
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
+
+    #[tokio::test]
+    async fn test_concurrent_available_path_reservation() {
+        let registry = PeerRegistry::new();
+        let dir = tempdir().unwrap();
+        let download_dir = dir.path().to_path_buf();
+        let app = make_router(registry, download_dir.clone());
+        
+        let payload1 = InitUploadRequest {
+            sender_name: "client1".to_string(),
+            file_name: "collision.txt".to_string(),
+            file_size: 100,
+            checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            chunk_size: 100,
+            upload_id: Some("id-1".to_string()),
+        };
+        let payload2 = InitUploadRequest {
+            sender_name: "client2".to_string(),
+            file_name: "collision.txt".to_string(),
+            file_size: 100,
+            checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            chunk_size: 100,
+            upload_id: Some("id-2".to_string()),
+        };
+        
+        let fut1 = app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/file/init")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&payload1).unwrap()))
+                .unwrap()
+        );
+        let fut2 = app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/file/init")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&payload2).unwrap()))
+                .unwrap()
+        );
+        
+        let (res1, res2) = tokio::join!(fut1, fut2);
+        assert_eq!(res1.unwrap().status(), StatusCode::OK);
+        assert_eq!(res2.unwrap().status(), StatusCode::OK);
+        
+        // 验证两个占位文件都存在，证明两个并发请求分配到了不同的文件名
+        assert!(download_dir.join("collision.txt").exists());
+        assert!(download_dir.join("collision_1.txt").exists());
+    }
 }
+
 
 
