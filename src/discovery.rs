@@ -74,6 +74,8 @@ pub async fn start_listener(registry: PeerRegistry) -> std::io::Result<()> {
     }
 }
 
+/// 返回本机用于局域网发现的 IP 地址列表。
+/// 若指定了 `bind_ip`，直接返回该 IP；否则自动探测本机 IP。
 pub fn get_local_ips(bind_ip: Option<Ipv4Addr>) -> Vec<String> {
     if let Some(ip) = bind_ip {
         return vec![ip.to_string()];
@@ -134,7 +136,6 @@ mod tests {
 
     #[test]
     fn test_get_local_ips_with_bind_ip() {
-        use std::net::Ipv4Addr;
         let ip = Ipv4Addr::new(192, 168, 1, 5);
         let ips = get_local_ips(Some(ip));
         assert_eq!(ips, vec!["192.168.1.5".to_string()]);
@@ -142,9 +143,8 @@ mod tests {
 
     #[test]
     fn test_get_local_ips_without_bind_ip() {
-        // None 时行为与原来一致：返回非空列表（有网络时）
         let ips = get_local_ips(None);
-        // 只验证不 panic，不对具体值做断言（CI 环境 IP 不固定）
-        let _ = ips;
+        // 本地有网卡时应返回至少一个 IP
+        assert!(!ips.is_empty(), "get_local_ips(None) 应在有网卡时返回非空列表");
     }
 }
