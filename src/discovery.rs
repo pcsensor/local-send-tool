@@ -9,10 +9,11 @@ pub const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 188);
 pub const MULTICAST_PORT: u16 = 50001;
 
 pub async fn broadcast_once(peer: &Peer, bind_ip: Option<Ipv4Addr>) -> std::io::Result<()> {
-    let bind_addr = bind_ip
-        .map(|ip| format!("{}:0", ip))
-        .unwrap_or_else(|| "0.0.0.0:0".to_string());
-    let socket = UdpSocket::bind(&bind_addr).await?;
+    let bind_addr: std::net::SocketAddr = std::net::SocketAddr::from((
+        bind_ip.unwrap_or(Ipv4Addr::UNSPECIFIED),
+        0u16,
+    ));
+    let socket = UdpSocket::bind(bind_addr).await?;
     let payload = serde_json::to_vec(peer)?;
     let target_addr: SocketAddr = format!("{}:{}", MULTICAST_ADDR, MULTICAST_PORT)
         .parse()
