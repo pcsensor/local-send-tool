@@ -325,7 +325,7 @@ pub async fn send_file_with_options(
 
     let metadata = tokio::fs::metadata(file_path).await?;
     let total_bytes = metadata.len();
-    let checksum = sha256_file(file_path).await?;
+    let checksum = sha256_file_with_progress(file_path, &options.progress).await?;
 
     if options.use_chunked {
         return send_file_chunked(
@@ -530,9 +530,33 @@ fn file_name_string(file_path: &Path) -> Result<String, DynError> {
 }
 
 pub async fn sha256_file(file_path: &Path) -> Result<String, DynError> {
+    sha256_file_with_progress(file_path, &ProgressMode::None).await
+}
+
+pub async fn sha256_file_with_progress(
+    file_path: &Path,
+    progress_mode: &ProgressMode,
+) -> Result<String, DynError> {
     let mut file = File::open(file_path).await?;
+    let metadata = file.metadata().await?;
+    let total_bytes = metadata.len();
+
+    let bar = match progress_mode {
+        ProgressMode::Indicatif => {
+            let bar = indicatif::ProgressBar::new(total_bytes);
+            if let Ok(style) = indicatif::ProgressStyle::with_template(
+                "{bar:40.cyan/blue} {bytes}/{total_bytes} Hashing...",
+            ) {
+                bar.set_style(style.progress_chars("=> "));
+            }
+            Some(bar)
+        }
+        _ => None,
+    };
+
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0; 64 * 1024];
+    let mut buffer = vec![0; 256 * 1024]; // 256KB 较大缓冲区以加快计算速度
+    let mut hashed_bytes = 0;
 
     loop {
         let read = file.read(&mut buffer).await?;
@@ -540,6 +564,14 @@ pub async fn sha256_file(file_path: &Path) -> Result<String, DynError> {
             break;
         }
         hasher.update(&buffer[..read]);
+        hashed_bytes += read as u64;
+        if let Some(bar) = &bar {
+            bar.set_position(hashed_bytes);
+        }
+    }
+
+    if let Some(bar) = bar {
+        bar.finish_and_clear();
     }
 
     Ok(format!("{:x}", hasher.finalize()))
