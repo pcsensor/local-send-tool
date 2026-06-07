@@ -1,6 +1,6 @@
 use crate::peer::PeerRegistry;
 use axum::{
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Multipart, State},
     http::StatusCode,
     response::IntoResponse,
     routing::post,
@@ -36,6 +36,10 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
             "/api/message",
             post(handle_message).layer(DefaultBodyLimit::max(1024 * 1024)),
         )
+        .route(
+            "/api/file",
+            post(handle_file).layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
+        )
         .with_state(state)
 }
 
@@ -51,6 +55,88 @@ async fn handle_message(
         "\n[收到来自 {} 的文字消息]: {}",
         payload.sender_name, payload.text
     );
+    Json(StandardResponse {
+        status: "success".to_string(),
+    })
+    .into_response()
+}
+
+async fn handle_file(
+    State(state): State<ServerState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    if let Err(e) = tokio::fs::create_dir_all(&state.download_dir).await {
+        eprintln!("Failed to create download directory: {}", e);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let mut sender_name = String::new();
+    let mut file_name = None;
+    let mut file_bytes = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = match field.name() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        if name == "sender_name" {
+            if let Ok(text) = field.text().await {
+                sender_name = text;
+            }
+        } else if name == "file" {
+            if let Some(fname) = field.file_name() {
+                file_name = Some(fname.to_string());
+            }
+            if let Ok(bytes) = field.bytes().await {
+                file_bytes = Some(bytes);
+            }
+        }
+    }
+
+    let original_name = match file_name {
+        Some(name) if !name.is_empty() => name,
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let bytes = match file_bytes {
+        Some(b) => b,
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let mut final_path = state.download_dir.join(&original_name);
+    if final_path.exists() {
+        let path = std::path::Path::new(&original_name);
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+        let mut counter = 1;
+        loop {
+            let new_name = if extension.is_empty() {
+                format!("{}_{}", stem, counter)
+            } else {
+                format!("{}_{}.{}", stem, counter, extension)
+            };
+            let check_path = state.download_dir.join(&new_name);
+            if !check_path.exists() {
+                final_path = check_path;
+                break;
+            }
+            counter += 1;
+        }
+    }
+
+    if let Err(e) = tokio::fs::write(&final_path, bytes).await {
+        eprintln!("Failed to write file: {}", e);
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    println!(
+        "\n[成功接收文件] 来自: {}, 保存至: {}",
+        sender_name,
+        final_path.display()
+    );
+
     Json(StandardResponse {
         status: "success".to_string(),
     })
@@ -107,6 +193,90 @@ mod tests {
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_success() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+
+        let boundary = "X-MULTIPART-BOUNDARY";
+        let body = format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"sender_name\"\r\n\r\n\
+             test-sender\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\n\
+             Hello, file!\r\n\
+             --{boundary}--\r\n"
+        );
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/file")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["status"], "success");
+
+        // 检查文件是否成功保存
+        let saved_path = tmp_dir.path().join("test.txt");
+        assert!(saved_path.exists());
+        let content = std::fs::read_to_string(saved_path).unwrap();
+        assert_eq!(content, "Hello, file!");
+    }
+
+    #[tokio::test]
+    async fn test_upload_file_conflict() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        
+        // 事先在下载目录创建 test.txt 和 test_1.txt
+        let download_dir = tmp_dir.path();
+        std::fs::write(download_dir.join("test.txt"), "old content").unwrap();
+        std::fs::write(download_dir.join("test_1.txt"), "old content 1").unwrap();
+
+        let router = make_router(registry, download_dir.to_path_buf());
+
+        let boundary = "X-MULTIPART-BOUNDARY";
+        let body = format!(
+            "--{boundary}\r\n\
+             Content-Disposition: form-data; name=\"sender_name\"\r\n\r\n\
+             test-sender\r\n\
+             --{boundary}\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\n\
+             New multipart data\r\n\
+             --{boundary}--\r\n"
+        );
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/file")
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(json["status"], "success");
+
+        // 应该保存为 test_2.txt，因为 test.txt 和 test_1.txt 都存在
+        let expected_path = download_dir.join("test_2.txt");
+        assert!(expected_path.exists());
+        let content = std::fs::read_to_string(expected_path).unwrap();
+        assert_eq!(content, "New multipart data");
     }
 }
 
