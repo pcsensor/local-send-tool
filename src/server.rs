@@ -398,6 +398,10 @@ async fn handle_file_chunk(
     let expected_bytes = chunk_len(session.file_size, session.chunk_size, index);
     let chunk_path = chunk_path(&session.temp_dir, index);
     if chunk_path.exists() {
+        if let Some(session) = state.upload_sessions.lock().await.get_mut(&upload_id) {
+            session.received_chunks.insert(index);
+            session.last_active = std::time::Instant::now();
+        }
         return Json(StandardResponse {
             status: "success".to_string(),
             received_bytes: Some(expected_bytes),
@@ -596,11 +600,33 @@ async fn save_chunk(
     index: u64,
     expected_bytes: u64,
 ) -> Result<u64, UploadError> {
-    let temp_path = temp_dir.join(format!("chunk_{}.part", index));
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let temp_path = temp_dir.join(format!("chunk_{}_{}.part", index, request_id));
     let final_path = chunk_path(temp_dir, index);
+
+    struct TempFileGuard {
+        path: std::path::PathBuf,
+        completed: bool,
+    }
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            if !self.completed {
+                let path = self.path.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::fs::remove_file(path).await;
+                });
+            }
+        }
+    }
+
+    let mut guard = TempFileGuard {
+        path: temp_path.clone(),
+        completed: false,
+    };
+
     let result = save_chunk_inner(&mut body, &temp_path, &final_path, expected_bytes).await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&temp_path).await;
+    if result.is_ok() {
+        guard.completed = true;
     }
     result
 }
@@ -1288,6 +1314,77 @@ mod tests {
         // 验证两个占位文件都存在，证明两个并发请求分配到了不同的文件名
         assert!(download_dir.join("collision.txt").exists());
         assert!(download_dir.join("collision_1.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_chunk_write() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+
+        // Initialize upload session
+        let upload_id = "concurrent-chunk-write-id";
+        let chunk_data = b"hello chunk";
+        let checksum = sha256_hex(chunk_data);
+        let init_req = InitUploadRequest {
+            sender_name: "test".to_string(),
+            file_name: "concurrent_chunk.txt".to_string(),
+            file_size: chunk_data.len() as u64,
+            checksum,
+            chunk_size: chunk_data.len() as u64,
+            upload_id: Some(upload_id.to_string()),
+        };
+
+        let response = router.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/file/init")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&init_req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Send two concurrent chunk upload PUT requests to /api/file/chunk/:upload_id/:index
+        let req1 = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/file/chunk/{}/0", upload_id))
+            .body(Body::from(chunk_data.to_vec()))
+            .unwrap();
+        let req2 = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/file/chunk/{}/0", upload_id))
+            .body(Body::from(chunk_data.to_vec()))
+            .unwrap();
+
+        let router1 = router.clone();
+        let router2 = router.clone();
+
+        let fut1 = tokio::spawn(async move {
+            router1.oneshot(req1).await.unwrap()
+        });
+        let fut2 = tokio::spawn(async move {
+            router2.oneshot(req2).await.unwrap()
+        });
+
+        let (res1, res2) = tokio::join!(fut1, fut2);
+        let status1 = res1.unwrap().status();
+        let status2 = res2.unwrap().status();
+
+        // Both requests should complete successfully
+        assert_eq!(status1, StatusCode::OK);
+        assert_eq!(status2, StatusCode::OK);
+
+        // Verify that the final chunk file exists and has correct size and content
+        let session_temp_dir = tmp_dir.path().join(format!(".concurrent_chunk.txt.chunks-{}", upload_id));
+        let chunk_file = session_temp_dir.join("chunk_0");
+        assert!(chunk_file.exists());
+        let saved_content = tokio::fs::read(&chunk_file).await.unwrap();
+        assert_eq!(saved_content.len(), chunk_data.len());
+        assert_eq!(saved_content, chunk_data.to_vec());
     }
 }
 
