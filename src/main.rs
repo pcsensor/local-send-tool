@@ -75,6 +75,78 @@ async fn find_available_port(start_port: u16) -> (tokio::net::TcpListener, u16) 
     }
 }
 
+fn is_direct_address(addr: &str) -> bool {
+    if addr.parse::<std::net::SocketAddr>().is_ok() || addr.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if addr.starts_with('[') && addr.ends_with(']') {
+        let inner = &addr[1..addr.len() - 1];
+        if inner.parse::<std::net::Ipv6Addr>().is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn fallback_address(to: &str) -> String {
+    if let Ok(ip) = to.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(ip) => format!("{}:8080", ip),
+            std::net::IpAddr::V6(ip) => format!("[{}]:8080", ip),
+        };
+    }
+    if to.parse::<std::net::SocketAddr>().is_ok() {
+        return to.to_string();
+    }
+    if to.starts_with('[') && to.ends_with(']') {
+        let inner = &to[1..to.len() - 1];
+        if inner.parse::<std::net::Ipv6Addr>().is_ok() {
+            return format!("{}:8080", to);
+        }
+    }
+    if !to.contains(':') {
+        return format!("{}:8080", to);
+    }
+    to.to_string()
+}
+
+async fn resolve_destination(to: &str) -> String {
+    if is_direct_address(to) {
+        return fallback_address(to);
+    }
+
+    let registry = lan_share::peer::PeerRegistry::new();
+    let listener_registry = registry.clone();
+
+    // 启动接收
+    let listen_handle = tokio::spawn(async move {
+        let _ = lan_share::discovery::start_listener(listener_registry).await;
+    });
+
+    println!("Scanning for target '{}' in local network...", to);
+
+    let mut found_peer = None;
+    // 每 50ms 轮询一次，最多等待 2.0 秒（40次）
+    for _ in 0..40 {
+        if let Some(peer) = registry.find_by_name_or_ip(to) {
+            found_peer = Some(peer);
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    listen_handle.abort();
+
+    if let Some(peer) = found_peer {
+        if let Some(ip) = peer.ips.first() {
+            format!("{}:{}", ip, peer.port)
+        } else {
+            fallback_address(to)
+        }
+    } else {
+        fallback_address(to)
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -141,7 +213,7 @@ async fn main() {
             if list.is_empty() {
                 println!("No peers discovered.");
             } else {
-                println!("{:<36} | {:<20} | {:<5} | {}", "UUID", "Name", "Port", "IPs");
+                println!("{:<36} | {:<20} | {:<5} | IPs", "UUID", "Name", "Port");
                 println!("{}", "-".repeat(80));
                 for peer in list {
                     println!(
@@ -155,27 +227,7 @@ async fn main() {
             }
         }
         Commands::SendText { to, name, text } => {
-            let registry = lan_share::peer::PeerRegistry::new();
-            let listener_registry = registry.clone();
-
-            // 启动接收
-            let listen_handle = tokio::spawn(async move {
-                let _ = lan_share::discovery::start_listener(listener_registry).await;
-            });
-
-            println!("Scanning for target '{}' in local network (1.5 seconds)...", to);
-            tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-            listen_handle.abort();
-
-            let dest_addr = if let Some(peer) = registry.find_by_name_or_ip(&to) {
-                if let Some(ip) = peer.ips.first() {
-                    format!("{}:{}", ip, peer.port)
-                } else {
-                    to.clone()
-                }
-            } else {
-                to.clone()
-            };
+            let dest_addr = resolve_destination(&to).await;
 
             let sender_name = match name {
                 Some(n) => n,
@@ -200,27 +252,7 @@ async fn main() {
                 std::process::exit(1);
             }
 
-            let registry = lan_share::peer::PeerRegistry::new();
-            let listener_registry = registry.clone();
-
-            // 启动接收
-            let listen_handle = tokio::spawn(async move {
-                let _ = lan_share::discovery::start_listener(listener_registry).await;
-            });
-
-            println!("Scanning for target '{}' in local network (1.5 seconds)...", to);
-            tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
-            listen_handle.abort();
-
-            let dest_addr = if let Some(peer) = registry.find_by_name_or_ip(&to) {
-                if let Some(ip) = peer.ips.first() {
-                    format!("{}:{}", ip, peer.port)
-                } else {
-                    to.clone()
-                }
-            } else {
-                to.clone()
-            };
+            let dest_addr = resolve_destination(&to).await;
 
             let sender_name = match name {
                 Some(n) => n,
@@ -239,6 +271,38 @@ async fn main() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_direct_address() {
+        assert!(is_direct_address("127.0.0.1:8080"));
+        assert!(is_direct_address("[::1]:8080"));
+        assert!(is_direct_address("127.0.0.1"));
+        assert!(is_direct_address("::1"));
+        assert!(is_direct_address("[::1]"));
+        assert!(!is_direct_address("localhost"));
+        assert!(!is_direct_address("archlinux"));
+    }
+
+    #[test]
+    fn test_fallback_address() {
+        assert_eq!(fallback_address("127.0.0.1"), "127.0.0.1:8080");
+        assert_eq!(fallback_address("archlinux"), "archlinux:8080");
+        assert_eq!(fallback_address("127.0.0.1:9000"), "127.0.0.1:9000");
+        assert_eq!(fallback_address("example.com:9000"), "example.com:9000");
+        assert_eq!(fallback_address("::1"), "[::1]:8080");
+        assert_eq!(fallback_address("[::1]"), "[::1]:8080");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_destination_direct() {
+        assert_eq!(resolve_destination("127.0.0.1:9000").await, "127.0.0.1:9000");
+        assert_eq!(resolve_destination("127.0.0.1").await, "127.0.0.1:8080");
     }
 }
 

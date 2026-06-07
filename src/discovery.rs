@@ -23,7 +23,7 @@ pub async fn start_broadcaster(peer: Peer) -> std::io::Result<()> {
         if let Err(e) = broadcast_once(&peer).await {
             eprintln!("Broadcaster error: {}", e);
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
