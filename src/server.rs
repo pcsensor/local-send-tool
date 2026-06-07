@@ -56,7 +56,7 @@ struct UploadSession {
     last_active: std::time::Instant,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct InitUploadRequest {
     sender_name: String,
     file_name: String,
@@ -80,6 +80,11 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
         download_dir,
         upload_sessions: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    #[cfg(target_pointer_width = "64")]
+    let max_file_limit = 10 * 1024 * 1024 * 1024;
+    #[cfg(not(target_pointer_width = "64"))]
+    let max_file_limit = 3 * 1024 * 1024 * 1024;
 
     let sessions = state.upload_sessions.clone();
     tokio::spawn(async move {
@@ -118,7 +123,7 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
         )
         .route(
             "/api/file",
-            post(handle_file).layer(DefaultBodyLimit::disable()),
+            post(handle_file).layer(DefaultBodyLimit::max(max_file_limit)),
         )
         .route(
             "/api/file/init",
@@ -126,7 +131,7 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
         )
         .route(
             "/api/file/chunk/:upload_id/:index",
-            put(handle_file_chunk).layer(DefaultBodyLimit::disable()),
+            put(handle_file_chunk).layer(tower_http::limit::RequestBodyLimitLayer::new(32 * 1024 * 1024)),
         )
         .route(
             "/api/file/complete/:upload_id",
@@ -1151,5 +1156,50 @@ mod tests {
         assert!(!map.contains_key("stale-id"));
         assert!(!session_dir.exists(), "过期的隐藏临时文件夹应该已被彻底删除");
     }
+
+    #[tokio::test]
+    async fn test_file_chunk_limit() {
+        let registry = PeerRegistry::new();
+        let dir = tempdir().unwrap();
+        let app = make_router(registry, dir.path().to_path_buf());
+        
+        // 直接通过 init 初始化一个 session
+        let init_req = InitUploadRequest {
+            sender_name: "test".to_string(),
+            file_name: "large.bin".to_string(),
+            file_size: 100 * 1024 * 1024,
+            checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            chunk_size: 8 * 1024 * 1024,
+            upload_id: Some("test-limit-id".to_string()),
+        };
+        let response = app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/file/init")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&init_req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 发送 33MB 的大分片数据 (通过伪造 content-length，发送 100 字节以节省内存)
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/file/chunk/test-limit-id/0")
+                    .header("content-length", (33 * 1024 * 1024).to_string())
+                    .body(Body::from(vec![0u8; 100]))
+                    .unwrap(),
+                )
+            .await
+            .unwrap();
+        
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }
+
 
