@@ -5,6 +5,16 @@ use lan_share::config::{
 use std::path::PathBuf;
 
 #[test]
+fn config_file_path_always_uses_dot_config_under_home() {
+    let home = PathBuf::from("/home/example");
+
+    assert_eq!(
+        lan_share::config::config_file_path_from_home(&home),
+        home.join(".config").join("lan-share").join("config.toml")
+    );
+}
+
+#[test]
 fn config_resolution_uses_cli_then_env_then_file_then_defaults() {
     let file_config = AppConfig::from_toml_str(
         r#"

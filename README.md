@@ -168,7 +168,7 @@ lan-share send-files --to archlinux --concurrency 2 ./a.zip ./b.zip ./c.zip
 ### 6. 配置文件与环境变量
 配置优先级为：CLI 参数 > 环境变量 > 配置文件 > 默认值。
 
-配置文件路径遵循系统标准配置目录，文件名为 `config.toml`。示例：
+配置文件路径固定为 `~/.config/lan-share/config.toml`，不随操作系统切换到其他标准配置目录。示例：
 
 ```toml
 [defaults]

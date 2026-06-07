@@ -1,7 +1,12 @@
 use crate::client::CompressionMode;
-use directories::ProjectDirs;
+use directories::UserDirs;
 use serde::Deserialize;
-use std::{collections::HashMap, env, error::Error, path::PathBuf};
+use std::{
+    collections::HashMap,
+    env,
+    error::Error,
+    path::{Path, PathBuf},
+};
 
 type ConfigResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -105,8 +110,14 @@ impl EnvConfig {
 }
 
 pub fn config_file_path() -> Option<PathBuf> {
-    ProjectDirs::from("dev", "lan-share", "lan-share")
-        .map(|dirs| dirs.config_dir().join("config.toml"))
+    UserDirs::new().map(|dirs| config_file_path_from_home(dirs.home_dir()))
+}
+
+pub fn config_file_path_from_home(home: impl AsRef<Path>) -> PathBuf {
+    home.as_ref()
+        .join(".config")
+        .join("lan-share")
+        .join("config.toml")
 }
 
 pub fn resolve_serve_settings(
