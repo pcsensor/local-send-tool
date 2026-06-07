@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 use async_compression::tokio::bufread::ZstdEncoder;
 use clap::ValueEnum;
 use reqwest::{
@@ -11,10 +13,7 @@ use std::{
     error::Error,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -109,10 +108,16 @@ struct ProgressSink {
     mode: ProgressMode,
     bar: Option<indicatif::ProgressBar>,
     started_at: Instant,
+    initial_bytes: u64,
+    chunk_progress: Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
 }
 
 impl ProgressSink {
     fn new(mode: ProgressMode, total_bytes: u64) -> Self {
+        Self::new_with_initial(mode, total_bytes, 0)
+    }
+
+    fn new_with_initial(mode: ProgressMode, total_bytes: u64, initial_bytes: u64) -> Self {
         let bar = match &mode {
             ProgressMode::Indicatif => {
                 let bar = indicatif::ProgressBar::new(total_bytes);
@@ -121,6 +126,7 @@ impl ProgressSink {
                 ) {
                     bar.set_style(style.progress_chars("=> "));
                 }
+                bar.set_position(initial_bytes);
                 Some(bar)
             }
             _ => None,
@@ -129,7 +135,17 @@ impl ProgressSink {
             mode,
             bar,
             started_at: Instant::now(),
+            initial_bytes,
+            chunk_progress: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn report_chunk(&self, chunk_index: u64, sent_in_chunk: u64, total_bytes: u64) {
+        let mut progress = self.chunk_progress.lock().unwrap();
+        progress.insert(chunk_index, sent_in_chunk);
+        let sum_chunks: u64 = progress.values().sum();
+        let total_sent = sum_chunks + self.initial_bytes;
+        self.report(total_sent.min(total_bytes), total_bytes);
     }
 
     fn report(&self, sent_bytes: u64, total_bytes: u64) {
@@ -165,6 +181,7 @@ struct ProgressReader<R> {
     sink: ProgressSink,
     sent_bytes: u64,
     total_bytes: u64,
+    chunk_index: u64,
 }
 
 #[derive(Clone)]
@@ -231,6 +248,17 @@ impl<R> ProgressReader<R> {
             sink,
             sent_bytes: 0,
             total_bytes,
+            chunk_index: 0,
+        }
+    }
+
+    fn with_chunk_index(inner: R, sink: ProgressSink, total_bytes: u64, chunk_index: u64) -> Self {
+        Self {
+            inner,
+            sink,
+            sent_bytes: 0,
+            total_bytes,
+            chunk_index,
         }
     }
 }
@@ -248,7 +276,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
             let read = after.saturating_sub(before) as u64;
             if read > 0 {
                 self.sent_bytes += read;
-                self.sink.report(self.sent_bytes, self.total_bytes);
+                self.sink.report_chunk(self.chunk_index, self.sent_bytes, self.total_bytes);
             }
         }
         poll
