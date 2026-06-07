@@ -319,7 +319,16 @@ async fn main() {
                 }
             });
 
-            // 2. 启动后台 UDP 心跳包广播
+            // 2. 启动后台定时清理失效节点
+            let clean_registry = registry.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    clean_registry.clean_stale(std::time::Duration::from_secs(9));
+                }
+            });
+
+            // 3. 启动后台 UDP 心跳包广播
             let peer = lan_share::peer::Peer {
                 uuid: uuid::Uuid::new_v4().to_string(),
                 name: node_name.clone(),
@@ -498,9 +507,10 @@ async fn main() {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     eprintln!(
-                        "Upload canceled. Connection closed; receiver will clean partial files within {:?}.",
+                        "Upload canceled. Waiting {:?} for receiver to clean partial files...",
                         cancel_timeout
                     );
+                    tokio::time::sleep(cancel_timeout).await;
                     std::process::exit(130);
                 }
             }
@@ -589,9 +599,10 @@ async fn main() {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     eprintln!(
-                        "Uploads canceled. Connections closed; receiver will clean partial files within {:?}.",
+                        "Uploads canceled. Waiting {:?} for receiver to clean partial files...",
                         cancel_timeout
                     );
+                    tokio::time::sleep(cancel_timeout).await;
                     std::process::exit(130);
                 }
             }
