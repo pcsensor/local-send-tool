@@ -76,7 +76,7 @@ async fn find_available_port(start_port: u16) -> (tokio::net::TcpListener, u16) 
 }
 
 fn is_direct_address(addr: &str) -> bool {
-    addr.parse::<std::net::SocketAddr>().is_ok()
+    addr.parse::<std::net::SocketAddr>().is_ok() || addr.parse::<std::net::IpAddr>().is_ok()
 }
 
 fn fallback_address(to: &str) -> String {
@@ -90,7 +90,7 @@ fn fallback_address(to: &str) -> String {
 
 async fn resolve_destination(to: &str) -> String {
     if is_direct_address(to) {
-        return to.to_string();
+        return fallback_address(to);
     }
 
     let registry = lan_share::peer::PeerRegistry::new();
@@ -260,7 +260,8 @@ mod tests {
     fn test_is_direct_address() {
         assert!(is_direct_address("127.0.0.1:8080"));
         assert!(is_direct_address("[::1]:8080"));
-        assert!(!is_direct_address("127.0.0.1"));
+        assert!(is_direct_address("127.0.0.1"));
+        assert!(is_direct_address("::1"));
         assert!(!is_direct_address("localhost"));
         assert!(!is_direct_address("archlinux"));
     }
@@ -271,6 +272,12 @@ mod tests {
         assert_eq!(fallback_address("archlinux"), "archlinux:8080");
         assert_eq!(fallback_address("127.0.0.1:9000"), "127.0.0.1:9000");
         assert_eq!(fallback_address("example.com:9000"), "example.com:9000");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_destination_direct() {
+        assert_eq!(resolve_destination("127.0.0.1:9000").await, "127.0.0.1:9000");
+        assert_eq!(resolve_destination("127.0.0.1").await, "127.0.0.1:8080");
     }
 }
 
