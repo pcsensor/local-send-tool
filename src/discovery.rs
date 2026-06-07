@@ -44,7 +44,8 @@ fn create_multicast_socket(bind_ip: Option<Ipv4Addr>) -> std::io::Result<StdUdpS
 
     socket.bind(&bind_addr.into())?;
 
-    // 若指定了 bind_ip，在该接口加入组播组；否则由系统自动选择
+    // bind_addr 是 socket 绑定的本地端口（用于接收数据）
+    // iface 是加入组播组的网卡接口 IP（决定从哪块网卡收组播包）
     let iface = bind_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
     socket.join_multicast_v4(&MULTICAST_ADDR, &iface)?;
     Ok(StdUdpSocket::from(socket))
