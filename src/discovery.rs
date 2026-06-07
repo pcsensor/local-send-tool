@@ -31,7 +31,7 @@ pub async fn start_broadcaster(peer: Peer, bind_ip: Option<Ipv4Addr>) -> std::io
     }
 }
 
-fn create_multicast_socket() -> std::io::Result<StdUdpSocket> {
+fn create_multicast_socket(bind_ip: Option<Ipv4Addr>) -> std::io::Result<StdUdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     #[cfg(not(windows))]
@@ -43,12 +43,15 @@ fn create_multicast_socket() -> std::io::Result<StdUdpSocket> {
     let bind_addr = SocketAddr::from((MULTICAST_ADDR, MULTICAST_PORT));
 
     socket.bind(&bind_addr.into())?;
-    socket.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED)?;
+
+    // 若指定了 bind_ip，在该接口加入组播组；否则由系统自动选择
+    let iface = bind_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
+    socket.join_multicast_v4(&MULTICAST_ADDR, &iface)?;
     Ok(StdUdpSocket::from(socket))
 }
 
-pub async fn start_listener(registry: PeerRegistry) -> std::io::Result<()> {
-    let std_socket = create_multicast_socket()?;
+pub async fn start_listener(registry: PeerRegistry, bind_ip: Option<Ipv4Addr>) -> std::io::Result<()> {
+    let std_socket = create_multicast_socket(bind_ip)?;
     std_socket.set_nonblocking(true)?;
     let socket = UdpSocket::from_std(std_socket)?;
     let mut buf = vec![0u8; 65535];
@@ -110,7 +113,7 @@ mod tests {
         // 开启接收监听
         let rx_registry = registry.clone();
         let join_handle = tokio::spawn(async move {
-            start_listener(rx_registry).await.unwrap();
+            start_listener(rx_registry, None).await.unwrap();
         });
 
         // 延迟后发送广播
