@@ -41,6 +41,7 @@ lan-share serve [FLAGS]
 *   `--dir <DIR>`：指定接收文件的保存目录。默认值为当前目录下的 `./downloads`。
 *   `-p`, `--port <PORT>`：指定绑定的 TCP 端口。默认值为 `8080`。**若端口已被占用，程序会自动递增尝试下一个可用端口**（如 8081, 8082...）。
 *   `-n`, `--name <NAME>`：为本地节点设置一个局域网别名（Alias）。默认使用系统主机名。
+*   `--bind-ip <IP>`：指定局域网网卡 IP（开启 TUN 网络代理，如 Clash/Sing-box 的 TUN 模式时，建议绑定实际的局域网 IP，例如 `192.168.1.5`）。
 
 **示例：**
 ```bash
@@ -57,8 +58,11 @@ lan-share serve --name archlinux --dir ~/Downloads/LAN-Share --port 9000
 使用 `peers` 命令扫描当前局域网中运行着 `lan-share serve` 的所有活动设备。
 
 ```bash
-lan-share peers
+lan-share peers [FLAGS]
 ```
+
+**支持参数：**
+*   `--bind-ip <IP>`：指定局域网网卡 IP（开启 TUN 网络代理时使用，例如 `192.168.1.5`）。
 
 **示例输出：**
 ```text
@@ -79,8 +83,9 @@ lan-share send-text --to <TARGET> [FLAGS] <TEXT>
 ```
 
 **支持参数：**
-*   `--to <TARGET>`（必需）：指定接收端目标。可以是**节点别名**（如 `archlinux`）、**UUID**、**IP地址**、**IP:Port** 或 **IPv6**。
+*   `--to <TARGET>`（必需）：指定接收端目标。可以是**节点别名**（如 `archlinux`）、**UUID**、**IP 地址**、**IP:Port** 或 **IPv6**。
 *   `-n`, `--name <SENDER_NAME>`：指定您的发送者署名。默认使用系统主机名。
+*   `--bind-ip <IP>`：指定局域网网卡 IP（开启 TUN 网络代理时使用，例如 `192.168.1.5`）。
 *   `<TEXT>`（位置参数）：要发送的文字消息内容，如有空格需用引号包裹。
 
 **示例：**
@@ -102,8 +107,9 @@ lan-share send-file --to <TARGET> [FLAGS] <FILE_PATH>
 ```
 
 **支持参数：**
-*   `--to <TARGET>`（必需）：指定接收端目标。可以是**节点别名**、**UUID**、**IP地址**、**IP:Port** 或 **IPv6**。
+*   `--to <TARGET>`（必需）：指定接收端目标。可以是**节点别名**、**UUID**、**IP 地址**、**IP:Port** 或 **IPv6**。
 *   `-n`, `--name <SENDER_NAME>`：指定您的发送者署名。默认使用系统主机名。
+*   `--bind-ip <IP>`：指定局域网网卡 IP（开启 TUN 网络代理时使用，例如 `192.168.1.5`）。
 *   `<FILE_PATH>`（位置参数）：本地要发送的文件路径。
 
 **示例：**
@@ -149,6 +155,26 @@ lan-share send-file --to 192.168.100.155:8080 ~/movie.mp4
 # peers 返回的 IPs 表里包含了多个地址，挑选能连通的地址直连
 lan-share send-text --to 192.168.100.155:8080 "Hello"
 ```
+
+---
+
+### 4. TUN 代理（Clash / Sing-box）下的设备发现与网卡绑定
+当你的设备开启了 TUN 模式的网络代理时，组播和广播包可能会被虚拟代理网卡拦截，导致无法在局域网内发现其他设备。
+
+**解决方案**：在接收端和发送端都通过 `--bind-ip` 参数指定绑定到实际的局域网物理网卡 IP（例如 `192.168.1.5`），强制网络包通过物理网卡收发，从而绕过虚拟代理网卡。
+
+*   **接收端（serve）绑定**：
+    ```bash
+    lan-share serve --bind-ip 192.168.1.5
+    ```
+*   **扫描端（peers）绑定**：
+    ```bash
+    lan-share peers --bind-ip 192.168.1.5
+    ```
+*   **发送端（send-text / send-file）绑定**：
+    ```bash
+    lan-share send-file --to archlinux --bind-ip 192.168.1.5 ~/movie.mp4
+    ```
 
 ---
 
