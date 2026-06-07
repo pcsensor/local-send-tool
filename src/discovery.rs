@@ -8,8 +8,11 @@ use tokio::net::UdpSocket;
 pub const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 188);
 pub const MULTICAST_PORT: u16 = 50001;
 
-pub async fn broadcast_once(peer: &Peer) -> std::io::Result<()> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+pub async fn broadcast_once(peer: &Peer, bind_ip: Option<Ipv4Addr>) -> std::io::Result<()> {
+    let bind_addr = bind_ip
+        .map(|ip| format!("{}:0", ip))
+        .unwrap_or_else(|| "0.0.0.0:0".to_string());
+    let socket = UdpSocket::bind(&bind_addr).await?;
     let payload = serde_json::to_vec(peer)?;
     let target_addr: SocketAddr = format!("{}:{}", MULTICAST_ADDR, MULTICAST_PORT)
         .parse()
@@ -18,9 +21,9 @@ pub async fn broadcast_once(peer: &Peer) -> std::io::Result<()> {
     Ok(())
 }
 
-pub async fn start_broadcaster(peer: Peer) -> std::io::Result<()> {
+pub async fn start_broadcaster(peer: Peer, bind_ip: Option<Ipv4Addr>) -> std::io::Result<()> {
     loop {
-        if let Err(e) = broadcast_once(&peer).await {
+        if let Err(e) = broadcast_once(&peer, bind_ip).await {
             eprintln!("Broadcaster error: {}", e);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -111,7 +114,7 @@ mod tests {
 
         // 延迟后发送广播
         tokio::time::sleep(Duration::from_millis(200)).await;
-        broadcast_once(&peer).await.unwrap();
+        broadcast_once(&peer, None).await.unwrap();
 
         // 轮询判定 + 超时机制，代替 sleep(500ms)
         let start = std::time::Instant::now();
