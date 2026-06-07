@@ -8,6 +8,8 @@
 
 - **服务自动发现**：基于 UDP 组播协议（多播地址 `224.0.0.188:50001`）实现，节点上线后自动广播，无需手动输入对方 IP。
 - **高性能流式文件传输**：服务端使用 Axum 异步接收文件并以 $O(1)$ 常数内存占用逐步流式写入磁盘，支持百兆、千兆网络满速传输。
+- **进度、重试与完整性校验**：发送端支持进度条、速度/ETA、指数退避重试；接收端使用 SHA-256 校验并在失败时清理临时文件。
+- **分片并行与断点续传**：可通过 `--chunked` 启用多连接分片上传，并使用 `--resume-upload-id` 继续未完成的分片传输。
 - **高安全性保障**：
   - **路径穿越防御**：严格净化接收文件名（只保留 Basename），防止恶意文件覆盖系统敏感文件。
   - **并发写安全**：采用内核级原子创建操作 `create_new`，在多用户高并发上传同名文件时，自动检测冲突并进行重名递增（例如 `file_1.txt`），无数据被覆盖风险。
@@ -110,6 +112,14 @@ lan-share send-file --to <TARGET> [FLAGS] <FILE_PATH>
 *   `--to <TARGET>`（必需）：指定接收端目标。可以是**节点别名**、**UUID**、**IP 地址**、**IP:Port** 或 **IPv6**。
 *   `-n`, `--name <SENDER_NAME>`：指定您的发送者署名。默认使用系统主机名。
 *   `--bind-ip <IP>`：指定局域网网卡 IP（开启 TUN 网络代理时使用，例如 `192.168.1.5`）。
+*   `--retry <N>`：发送失败时最多重试 N 次。
+*   `--compress <auto|always|never>`：是否使用 zstd 压缩文件流，默认 `auto`。
+*   `--progress`：显示上传进度、速度和 ETA。
+*   `--chunked`：启用分片多连接上传。
+*   `--chunk-size <BYTES>`：分片大小，默认 `8388608`（8 MiB）。
+*   `--chunk-concurrency <N>`：分片并发连接数，默认 `4`。
+*   `--resume-upload-id <ID>`：继续指定 upload id 的未完成分片上传。
+*   `--cancel-timeout <SECONDS>`：收到 Ctrl+C 后等待接收端清理的提示超时时间，默认 `10`。
 *   `<FILE_PATH>`（位置参数）：本地要发送的文件路径。
 
 **示例：**
@@ -119,6 +129,66 @@ lan-share send-file --to archlinux ~/Downloads/ticket.pdf
 
 # 使用直连 IP 传输 zip 压缩包
 lan-share send-file --to 192.168.100.155:8080 ./archive.zip
+
+# 显示进度并在失败时重试 3 次
+lan-share send-file --to archlinux --progress --retry 3 ./large.log
+
+# 启用分片多连接上传；如果中断，可保留输出中的 upload id 后续续传
+lan-share send-file --to archlinux --chunked --chunk-concurrency 4 ./movie.mkv
+```
+
+---
+
+### 5. 批量发送多个文件
+使用 `send-files` 命令一次发送多个文件，默认最多 3 个文件并发上传。
+
+```bash
+lan-share send-files --to <TARGET> [FLAGS] <FILE_PATH>...
+```
+
+**支持参数：**
+*   `--to <TARGET>`（必需）：指定接收端目标。
+*   `-n`, `--name <SENDER_NAME>`：指定您的发送者署名。
+*   `--bind-ip <IP>`：指定局域网网卡 IP。
+*   `--concurrency <N>`：同时发送的文件数，默认 `3`。
+*   `--retry <N>`：每个文件失败时最多重试 N 次。
+*   `--compress <auto|always|never>`：是否使用 zstd 压缩文件流，默认 `auto`。
+*   `--progress`：显示上传进度、速度和 ETA。
+*   `--chunked`：为每个文件启用分片多连接上传。
+*   `--chunk-size <BYTES>`：分片大小，默认 `8388608`（8 MiB）。
+*   `--chunk-concurrency <N>`：每个文件的分片并发连接数，默认 `4`。
+
+**示例：**
+```bash
+lan-share send-files --to archlinux --concurrency 2 ./a.zip ./b.zip ./c.zip
+```
+
+---
+
+### 6. 配置文件与环境变量
+配置优先级为：CLI 参数 > 环境变量 > 配置文件 > 默认值。
+
+配置文件路径遵循系统标准配置目录，文件名为 `config.toml`。示例：
+
+```toml
+[defaults]
+download_dir = "/Users/alice/Downloads/LAN-Share"
+port = 9000
+name = "macbook"
+bind_ip = "192.168.1.5"
+retry = 3
+compress = "auto"
+```
+
+支持的环境变量：
+
+```bash
+LAN_SHARE_DIR=/Users/alice/Downloads/LAN-Share
+LAN_SHARE_PORT=9000
+LAN_SHARE_NAME=macbook
+LAN_SHARE_BIND_IP=192.168.1.5
+LAN_SHARE_RETRY=3
+LAN_SHARE_COMPRESS=auto
 ```
 
 ---
