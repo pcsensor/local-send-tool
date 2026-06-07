@@ -767,6 +767,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "socket2",
  "tokio",
  "tower-http 0.5.2",
  "uuid",
