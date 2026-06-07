@@ -604,7 +604,7 @@ async fn complete_chunked_upload_inner(
         .open(merge_path)
         .await?;
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0; 64 * 1024];
+    let mut buffer = vec![0; 1024 * 1024]; // 1MB buffer
 
     for index in 0..chunk_count(session.file_size, session.chunk_size) {
         let mut chunk = tokio::fs::File::open(chunk_path(&session.temp_dir, index)).await?;

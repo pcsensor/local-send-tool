@@ -433,6 +433,10 @@ async fn send_file_chunked(
         handle.await??;
     }
 
+    if let ProgressMode::Indicatif = options.progress {
+        println!("Verifying file integrity on target server...");
+    }
+
     let complete_url = format_url(
         to_addr,
         &format!("/api/file/complete/{}", init_response.upload_id),
