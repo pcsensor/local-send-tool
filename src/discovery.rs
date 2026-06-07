@@ -82,17 +82,41 @@ pub async fn start_listener(registry: PeerRegistry, bind_ip: Option<Ipv4Addr>) -
     }
 }
 
-/// 返回本机用于局域网发现的 IP 地址列表。
-/// 若指定了 `bind_ip`，直接返回该 IP；否则自动探测本机 IP。
 pub fn get_local_ips(bind_ip: Option<Ipv4Addr>) -> Vec<String> {
     if let Some(ip) = bind_ip {
         return vec![ip.to_string()];
     }
-    if let Ok(ip) = local_ip() {
-        vec![ip.to_string()]
+    let mut ips = if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
+        let mut list: Vec<String> = interfaces
+            .into_iter()
+            .filter_map(|(_, ip)| {
+                if ip.is_ipv4() && !ip.is_loopback() {
+                    Some(ip.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if list.is_empty() {
+            if let Ok(ip) = local_ip() {
+                if ip.is_ipv4() {
+                    list.push(ip.to_string());
+                }
+            }
+        }
+        list
+    } else if let Ok(ip) = local_ip() {
+        if ip.is_ipv4() {
+            vec![ip.to_string()]
+        } else {
+            vec![]
+        }
     } else {
         vec![]
-    }
+    };
+    ips.sort();
+    ips.dedup();
+    ips
 }
 
 #[cfg(test)]
@@ -152,7 +176,20 @@ mod tests {
     #[test]
     fn test_get_local_ips_without_bind_ip() {
         let ips = get_local_ips(None);
-        // 本地有网卡时应返回至少一个 IP
-        assert!(!ips.is_empty(), "get_local_ips(None) 应在有网卡时返回非空列表");
+        if !ips.is_empty() {
+            for ip in &ips {
+                assert_ne!(ip, "127.0.0.1", "获取到的局域网 IP 列表中不应包含 Loopback 环回地址");
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_local_ips_does_not_contain_loopback() {
+        let ips = get_local_ips(None);
+        if !ips.is_empty() {
+            for ip in &ips {
+                assert_ne!(ip, "127.0.0.1", "获取到的局域网 IP 列表中不应包含 Loopback 环回地址");
+            }
+        }
     }
 }
