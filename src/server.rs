@@ -91,7 +91,6 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
 
-            let mut paths_to_remove = Vec::new();
             {
                 let mut map = sessions.lock().await;
                 let now = std::time::Instant::now();
@@ -105,17 +104,13 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
 
                 for id in stale_ids {
                     if let Some(session) = map.remove(&id) {
-                        paths_to_remove.push((session.temp_dir, session.final_path));
-                    }
-                }
-            } // 锁在这里释放
-
-            for (temp_dir, final_path) in paths_to_remove {
-                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                if final_path.exists() {
-                    if let Ok(metadata) = tokio::fs::metadata(&final_path).await {
-                        if metadata.len() == 0 {
-                            let _ = tokio::fs::remove_file(&final_path).await;
+                        let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
+                        if session.final_path.exists() {
+                            if let Ok(metadata) = tokio::fs::metadata(&session.final_path).await {
+                                if metadata.len() == 0 {
+                                    let _ = tokio::fs::remove_file(&session.final_path).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -1385,6 +1380,185 @@ mod tests {
         let saved_content = tokio::fs::read(&chunk_file).await.unwrap();
         assert_eq!(saved_content.len(), chunk_data.len());
         assert_eq!(saved_content, chunk_data.to_vec());
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_init_race() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let download_dir = tmp_dir.path().to_path_buf();
+        
+        // 1. 模拟旧版将分片删除放在锁外的逻辑（即存在竞态条件）
+        let upload_id = "race-test-id".to_string();
+        let basename = "race.txt";
+        let temp_dir = chunk_upload_dir(&download_dir, basename, &upload_id);
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        
+        let chunk_file = chunk_path(&temp_dir, 0);
+        tokio::fs::write(&chunk_file, b"data").await.unwrap();
+        
+        let final_path = download_dir.join(basename);
+        tokio::fs::File::create(&final_path).await.unwrap();
+        
+        let stale_session = UploadSession {
+            sender_name: "sender".to_string(),
+            final_path: final_path.clone(),
+            temp_dir: temp_dir.clone(),
+            file_size: 4,
+            chunk_size: 4,
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            received_chunks: BTreeSet::new(),
+            last_active: std::time::Instant::now() - std::time::Duration::from_secs(7200),
+        };
+        
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().await.insert(upload_id.clone(), stale_session);
+
+        let (tx_removed, rx_removed) = tokio::sync::oneshot::channel::<UploadSession>();
+        let (tx_inited, rx_inited) = tokio::sync::oneshot::channel::<UploadSession>();
+        
+        // 启动模拟旧版清理逻辑的 task
+        let sessions_clone = sessions.clone();
+        let cleanup_task = tokio::spawn(async move {
+            let mut map = sessions_clone.lock().await;
+            let session = map.remove("race-test-id").unwrap();
+            drop(map); // 锁在此处被释放了
+            
+            // 发送信号通知主线程：内存 map 已移除且锁已释放
+            let _ = tx_removed.send(session);
+            
+            // 等待主线程 init 完成的信号
+            let session = rx_inited.await.unwrap();
+            
+            // 开始物理删除
+            let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
+            if session.final_path.exists() {
+                if let Ok(metadata) = tokio::fs::metadata(&session.final_path).await {
+                    if metadata.len() == 0 {
+                        let _ = tokio::fs::remove_file(&session.final_path).await;
+                    }
+                }
+            }
+        });
+        
+        // 等待清理线程把 map 移除并释放锁
+        let session = rx_removed.await.unwrap();
+        
+        let state = ServerState {
+            registry: registry.clone(),
+            download_dir: download_dir.clone(),
+            upload_sessions: sessions.clone(),
+        };
+        
+        let payload = InitUploadRequest {
+            sender_name: "sender".to_string(),
+            file_name: basename.to_string(),
+            file_size: 4,
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            chunk_size: 4,
+            upload_id: Some(upload_id.clone()),
+        };
+        
+        // 客户端重新请求 init，此时会扫描并获取残留的分片
+        let _response = handle_file_init(
+            axum::extract::State(state.clone()),
+            Ok(axum::Json(payload)),
+        ).await;
+        
+        // 通知清理线程已完成 init，可以开始物理删除了
+        let _ = tx_inited.send(session);
+        
+        cleanup_task.await.unwrap();
+        
+        // 验证竞态的发生：Session 中记录了分片 [0]，但磁盘上该分片却已被清理线程删除！
+        let final_sessions = sessions.lock().await;
+        let active_session = final_sessions.get("race-test-id").unwrap();
+        assert!(active_session.received_chunks.contains(&0));
+        assert!(!chunk_file.exists());
+        
+        drop(final_sessions);
+        
+        // 2. 模拟新版将分片删除放在锁内的逻辑（竞态被消除）
+        let upload_id_safe = "race-test-id-safe".to_string();
+        let temp_dir_safe = chunk_upload_dir(&download_dir, basename, &upload_id_safe);
+        tokio::fs::create_dir_all(&temp_dir_safe).await.unwrap();
+        
+        let chunk_file_safe = chunk_path(&temp_dir_safe, 0);
+        tokio::fs::write(&chunk_file_safe, b"data").await.unwrap();
+        
+        let final_path_safe = download_dir.join(format!("{}.safe", basename));
+        tokio::fs::File::create(&final_path_safe).await.unwrap();
+        
+        let stale_session_safe = UploadSession {
+            sender_name: "sender".to_string(),
+            final_path: final_path_safe.clone(),
+            temp_dir: temp_dir_safe.clone(),
+            file_size: 4,
+            chunk_size: 4,
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            received_chunks: BTreeSet::new(),
+            last_active: std::time::Instant::now() - std::time::Duration::from_secs(7200),
+        };
+        
+        let sessions_safe = Arc::new(Mutex::new(HashMap::new()));
+        sessions_safe.lock().await.insert(upload_id_safe.clone(), stale_session_safe);
+        
+        let (tx_locked, rx_locked) = tokio::sync::oneshot::channel();
+
+        // 启动模拟锁内清理的 task
+        let sessions_safe_clone = sessions_safe.clone();
+        let cleanup_task_safe = tokio::spawn(async move {
+            let mut map = sessions_safe_clone.lock().await;
+            
+            // 通知主线程：清理线程已锁定了 map 且正在处理中（此时锁尚未释放）
+            let _ = tx_locked.send(());
+            
+            if let Some(session) = map.remove("race-test-id-safe") {
+                // 物理删除和 map 移除均在锁持有期间发生
+                let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
+                if session.final_path.exists() {
+                    if let Ok(metadata) = tokio::fs::metadata(&session.final_path).await {
+                        if metadata.len() == 0 {
+                            let _ = tokio::fs::remove_file(&session.final_path).await;
+                        }
+                    }
+                }
+            }
+            // 锁在此处被释放
+        });
+        
+        // 等待清理线程锁定 map 并开始处理
+        rx_locked.await.unwrap();
+        
+        let state_safe = ServerState {
+            registry: registry.clone(),
+            download_dir: download_dir.clone(),
+            upload_sessions: sessions_safe.clone(),
+        };
+        
+        let payload_safe = InitUploadRequest {
+            sender_name: "sender".to_string(),
+            file_name: format!("{}.safe", basename),
+            file_size: 4,
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            chunk_size: 4,
+            upload_id: Some(upload_id_safe.clone()),
+        };
+        
+        // 客户端请求 init 动作，由于锁被 cleanup 持有而被阻塞。
+        // 等它获得锁时，分片文件已被彻底删除，所以扫描不到任何分片。
+        let _response_safe = handle_file_init(
+            axum::extract::State(state_safe.clone()),
+            Ok(axum::Json(payload_safe)),
+        ).await;
+        
+        cleanup_task_safe.await.unwrap();
+        
+        // 验证：新注册的 Session 中 received_chunks 是空的，避免了不一致的发生
+        let final_sessions_safe = sessions_safe.lock().await;
+        let active_session_safe = final_sessions_safe.get("race-test-id-safe").unwrap();
+        assert!(active_session_safe.received_chunks.is_empty());
+        assert!(!chunk_file_safe.exists());
     }
 }
 
