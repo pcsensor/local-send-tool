@@ -24,6 +24,12 @@ pub struct ConfigDefaults {
     pub bind_ip: Option<String>,
     pub retry: Option<usize>,
     pub compress: Option<CompressionMode>,
+    pub progress: Option<bool>,
+    pub cancel_timeout: Option<u64>,
+    pub chunked: Option<bool>,
+    pub chunk_size: Option<u64>,
+    pub chunk_concurrency: Option<usize>,
+    pub concurrency: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -34,6 +40,12 @@ pub struct EnvConfig {
     pub bind_ip: Option<String>,
     pub retry: Option<usize>,
     pub compress: Option<CompressionMode>,
+    pub progress: Option<bool>,
+    pub cancel_timeout: Option<u64>,
+    pub chunked: Option<bool>,
+    pub chunk_size: Option<u64>,
+    pub chunk_concurrency: Option<usize>,
+    pub concurrency: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -44,6 +56,12 @@ pub struct ConfigOverrides {
     pub bind_ip: Option<String>,
     pub retry: Option<usize>,
     pub compress: Option<CompressionMode>,
+    pub progress: Option<bool>,
+    pub cancel_timeout: Option<u64>,
+    pub chunked: Option<bool>,
+    pub chunk_size: Option<u64>,
+    pub chunk_concurrency: Option<usize>,
+    pub concurrency: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -60,6 +78,12 @@ pub struct SendSettings {
     pub bind_ip: Option<String>,
     pub retry_attempts: usize,
     pub compression: CompressionMode,
+    pub progress: bool,
+    pub cancel_timeout: u64,
+    pub chunked: bool,
+    pub chunk_size: u64,
+    pub chunk_concurrency: usize,
+    pub concurrency: usize,
 }
 
 impl AppConfig {
@@ -105,6 +129,21 @@ impl EnvConfig {
                 Some(value) => Some(parse_compression_mode(value)?),
                 None => None,
             },
+            progress: parse_optional(values.get("LAN_SHARE_PROGRESS"), "LAN_SHARE_PROGRESS")?,
+            cancel_timeout: parse_optional(
+                values.get("LAN_SHARE_CANCEL_TIMEOUT"),
+                "LAN_SHARE_CANCEL_TIMEOUT",
+            )?,
+            chunked: parse_optional(values.get("LAN_SHARE_CHUNKED"), "LAN_SHARE_CHUNKED")?,
+            chunk_size: parse_optional(values.get("LAN_SHARE_CHUNK_SIZE"), "LAN_SHARE_CHUNK_SIZE")?,
+            chunk_concurrency: parse_optional(
+                values.get("LAN_SHARE_CHUNK_CONCURRENCY"),
+                "LAN_SHARE_CHUNK_CONCURRENCY",
+            )?,
+            concurrency: parse_optional(
+                values.get("LAN_SHARE_CONCURRENCY"),
+                "LAN_SHARE_CONCURRENCY",
+            )?,
         })
     }
 }
@@ -171,6 +210,36 @@ pub fn resolve_send_settings(
             .or(env.compress)
             .or(config.defaults.compress)
             .unwrap_or_default(),
+        progress: cli
+            .progress
+            .or(env.progress)
+            .or(config.defaults.progress)
+            .unwrap_or(false),
+        cancel_timeout: cli
+            .cancel_timeout
+            .or(env.cancel_timeout)
+            .or(config.defaults.cancel_timeout)
+            .unwrap_or(10),
+        chunked: cli
+            .chunked
+            .or(env.chunked)
+            .or(config.defaults.chunked)
+            .unwrap_or(false),
+        chunk_size: cli
+            .chunk_size
+            .or(env.chunk_size)
+            .or(config.defaults.chunk_size)
+            .unwrap_or(8 * 1024 * 1024),
+        chunk_concurrency: cli
+            .chunk_concurrency
+            .or(env.chunk_concurrency)
+            .or(config.defaults.chunk_concurrency)
+            .unwrap_or(4),
+        concurrency: cli
+            .concurrency
+            .or(env.concurrency)
+            .or(config.defaults.concurrency)
+            .unwrap_or(3),
     }
 }
 

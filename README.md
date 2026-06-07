@@ -178,7 +178,17 @@ name = "macbook"
 bind_ip = "192.168.1.5"
 retry = 3
 compress = "auto"
+progress = true
+cancel_timeout = 10
+chunked = false
+chunk_size = 8388608
+chunk_concurrency = 4
+concurrency = 3
 ```
+
+这些字段会作为对应 CLI 参数的默认值：`--dir`、`--port`、`--name`、`--bind-ip`、`--retry`、`--compress`、`--progress`、`--cancel-timeout`、`--chunked`、`--chunk-size`、`--chunk-concurrency`、`send-files --concurrency`。
+
+以下参数不写入全局配置：`--to`、文字内容、文件路径、文件列表、`--resume-upload-id`。它们属于单次发送任务，应该每次在命令行指定。
 
 支持的环境变量：
 
@@ -189,6 +199,12 @@ LAN_SHARE_NAME=macbook
 LAN_SHARE_BIND_IP=192.168.1.5
 LAN_SHARE_RETRY=3
 LAN_SHARE_COMPRESS=auto
+LAN_SHARE_PROGRESS=true
+LAN_SHARE_CANCEL_TIMEOUT=10
+LAN_SHARE_CHUNKED=false
+LAN_SHARE_CHUNK_SIZE=8388608
+LAN_SHARE_CHUNK_CONCURRENCY=4
+LAN_SHARE_CONCURRENCY=3
 ```
 
 ---

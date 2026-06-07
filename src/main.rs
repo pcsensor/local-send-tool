@@ -79,24 +79,24 @@ enum Commands {
         compress: Option<lan_share::client::CompressionMode>,
 
         /// Show upload progress, speed, and ETA
-        #[arg(long)]
-        progress: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+        progress: Option<bool>,
 
         /// Seconds to wait for graceful cancellation cleanup after Ctrl+C
-        #[arg(long, default_value_t = 10)]
-        cancel_timeout: u64,
+        #[arg(long)]
+        cancel_timeout: Option<u64>,
 
         /// Use chunked multi-connection upload
-        #[arg(long)]
-        chunked: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+        chunked: Option<bool>,
 
         /// Chunk size in bytes for chunked uploads
-        #[arg(long, default_value_t = 8 * 1024 * 1024)]
-        chunk_size: u64,
+        #[arg(long)]
+        chunk_size: Option<u64>,
 
         /// Number of concurrent chunk upload connections
-        #[arg(long, default_value_t = 4)]
-        chunk_concurrency: usize,
+        #[arg(long)]
+        chunk_concurrency: Option<usize>,
 
         /// Resume a previous chunked upload by upload id
         #[arg(long)]
@@ -117,8 +117,8 @@ enum Commands {
         files: Vec<PathBuf>,
 
         /// Number of concurrent uploads
-        #[arg(long, default_value_t = 3)]
-        concurrency: usize,
+        #[arg(long)]
+        concurrency: Option<usize>,
 
         /// 指定局域网网卡 IP（开启 TUN 代理时使用，例如 192.168.1.5）
         #[arg(long, value_name = "IP")]
@@ -133,24 +133,24 @@ enum Commands {
         compress: Option<lan_share::client::CompressionMode>,
 
         /// Show upload progress, speed, and ETA
-        #[arg(long)]
-        progress: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+        progress: Option<bool>,
 
         /// Seconds to wait for graceful cancellation cleanup after Ctrl+C
-        #[arg(long, default_value_t = 10)]
-        cancel_timeout: u64,
+        #[arg(long)]
+        cancel_timeout: Option<u64>,
 
         /// Use chunked multi-connection upload for each file
-        #[arg(long)]
-        chunked: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+        chunked: Option<bool>,
 
         /// Chunk size in bytes for chunked uploads
-        #[arg(long, default_value_t = 8 * 1024 * 1024)]
-        chunk_size: u64,
+        #[arg(long)]
+        chunk_size: Option<u64>,
 
         /// Number of concurrent chunk upload connections per file
-        #[arg(long, default_value_t = 4)]
-        chunk_concurrency: usize,
+        #[arg(long)]
+        chunk_concurrency: Option<usize>,
     },
 }
 
@@ -438,6 +438,11 @@ async fn main() {
                     bind_ip,
                     retry,
                     compress,
+                    progress,
+                    cancel_timeout,
+                    chunked,
+                    chunk_size,
+                    chunk_concurrency,
                     ..lan_share::config::ConfigOverrides::default()
                 },
                 &env_config,
@@ -457,11 +462,11 @@ async fn main() {
             let options = file_send_options(FileSendCliOptions {
                 retry_attempts: settings.retry_attempts,
                 compression: settings.compression,
-                progress,
-                cancel_timeout_secs: cancel_timeout,
-                use_chunked: chunked,
-                chunk_size,
-                chunk_concurrency,
+                progress: settings.progress,
+                cancel_timeout_secs: settings.cancel_timeout,
+                use_chunked: settings.chunked,
+                chunk_size: settings.chunk_size,
+                chunk_concurrency: settings.chunk_concurrency,
                 resume_upload_id,
             });
             println!(
@@ -517,6 +522,12 @@ async fn main() {
                     bind_ip,
                     retry,
                     compress,
+                    progress,
+                    cancel_timeout,
+                    chunked,
+                    chunk_size,
+                    chunk_concurrency,
+                    concurrency,
                     ..lan_share::config::ConfigOverrides::default()
                 },
                 &env_config,
@@ -536,11 +547,11 @@ async fn main() {
             let options = file_send_options(FileSendCliOptions {
                 retry_attempts: settings.retry_attempts,
                 compression: settings.compression,
-                progress,
-                cancel_timeout_secs: cancel_timeout,
-                use_chunked: chunked,
-                chunk_size,
-                chunk_concurrency,
+                progress: settings.progress,
+                cancel_timeout_secs: settings.cancel_timeout,
+                use_chunked: settings.chunked,
+                chunk_size: settings.chunk_size,
+                chunk_concurrency: settings.chunk_concurrency,
                 resume_upload_id: None,
             });
             let cancel_timeout = options.cancel_timeout;
@@ -549,10 +560,10 @@ async fn main() {
                 files.len(),
                 dest_addr,
                 sender_name,
-                concurrency
+                settings.concurrency
             );
             tokio::select! {
-                result = lan_share::client::send_files(&dest_addr, &sender_name, &files, concurrency, options) => {
+                result = lan_share::client::send_files(&dest_addr, &sender_name, &files, settings.concurrency, options) => {
                     match result {
                         Ok(_) => println!("Files sent successfully!"),
                         Err(e) => {
@@ -639,6 +650,14 @@ mod tests {
             "3",
             "--compress",
             "always",
+            "--progress",
+            "--cancel-timeout",
+            "12",
+            "--chunked",
+            "--chunk-size",
+            "4096",
+            "--chunk-concurrency",
+            "2",
             "a.txt",
             "b.txt",
         ])
@@ -651,13 +670,46 @@ mod tests {
                 concurrency,
                 retry,
                 compress,
+                progress,
+                cancel_timeout,
+                chunked,
+                chunk_size,
+                chunk_concurrency,
                 ..
             } => {
                 assert_eq!(to, "127.0.0.1:8080");
                 assert_eq!(files, vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]);
-                assert_eq!(concurrency, 2);
+                assert_eq!(concurrency, Some(2));
                 assert_eq!(retry, Some(3));
                 assert_eq!(compress, Some(lan_share::client::CompressionMode::Always));
+                assert_eq!(progress, Some(true));
+                assert_eq!(cancel_timeout, Some(12));
+                assert_eq!(chunked, Some(true));
+                assert_eq!(chunk_size, Some(4096));
+                assert_eq!(chunk_concurrency, Some(2));
+            }
+            _ => panic!("expected send-files command"),
+        }
+    }
+
+    #[test]
+    fn test_send_files_progress_flag_does_not_consume_file_path() {
+        let cli = Cli::try_parse_from([
+            "lan-share",
+            "send-files",
+            "--to",
+            "127.0.0.1:8080",
+            "--progress",
+            "a.txt",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::SendFiles {
+                files, progress, ..
+            } => {
+                assert_eq!(progress, Some(true));
+                assert_eq!(files, vec![PathBuf::from("a.txt")]);
             }
             _ => panic!("expected send-files command"),
         }
