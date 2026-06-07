@@ -276,7 +276,9 @@ async fn main() {
             name,
             bind_ip,
         } => {
+            let home_dir = required_home_dir();
             let settings = lan_share::config::resolve_serve_settings(
+                &home_dir,
                 lan_share::config::ConfigOverrides {
                     download_dir: dir,
                     port,
@@ -427,6 +429,8 @@ async fn main() {
             chunk_concurrency,
             resume_upload_id,
         } => {
+            let home_dir = required_home_dir();
+            let file = lan_share::config::expand_tilde_path(file, &home_dir);
             if !file.exists() {
                 eprintln!("Error: File '{}' does not exist.", file.display());
                 std::process::exit(1);
@@ -509,6 +513,11 @@ async fn main() {
             chunk_size,
             chunk_concurrency,
         } => {
+            let home_dir = required_home_dir();
+            let files = files
+                .into_iter()
+                .map(|file| lan_share::config::expand_tilde_path(file, &home_dir))
+                .collect::<Vec<_>>();
             for file in &files {
                 if !file.exists() {
                     eprintln!("Error: File '{}' does not exist.", file.display());
@@ -582,6 +591,13 @@ async fn main() {
             }
         }
     }
+}
+
+fn required_home_dir() -> PathBuf {
+    lan_share::config::user_home_dir().unwrap_or_else(|| {
+        eprintln!("无法确定用户主目录，无法解析路径中的 ~");
+        std::process::exit(1);
+    })
 }
 
 struct FileSendCliOptions {

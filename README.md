@@ -172,7 +172,7 @@ lan-share send-files --to archlinux --concurrency 2 ./a.zip ./b.zip ./c.zip
 
 ```toml
 [defaults]
-download_dir = "/Users/alice/Downloads/LAN-Share"
+download_dir = "~/Downloads/LAN-Share"
 port = 9000
 name = "macbook"
 bind_ip = "192.168.1.5"
@@ -188,12 +188,14 @@ concurrency = 3
 
 这些字段会作为对应 CLI 参数的默认值：`--dir`、`--port`、`--name`、`--bind-ip`、`--retry`、`--compress`、`--progress`、`--cancel-timeout`、`--chunked`、`--chunk-size`、`--chunk-concurrency`、`send-files --concurrency`。
 
+路径值支持以 `~` 开头表示用户主目录，例如 `~/Downloads/LAN-Share`。该规则由 `lan-share` 自己处理，在 Windows、macOS 和 Linux 上都适用于配置文件、`LAN_SHARE_DIR`、带引号传入的 `--dir` 以及发送文件路径。
+
 以下参数不写入全局配置：`--to`、文字内容、文件路径、文件列表、`--resume-upload-id`。它们属于单次发送任务，应该每次在命令行指定。
 
 支持的环境变量：
 
 ```bash
-LAN_SHARE_DIR=/Users/alice/Downloads/LAN-Share
+LAN_SHARE_DIR=~/Downloads/LAN-Share
 LAN_SHARE_PORT=9000
 LAN_SHARE_NAME=macbook
 LAN_SHARE_BIND_IP=192.168.1.5

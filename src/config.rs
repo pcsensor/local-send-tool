@@ -88,27 +88,46 @@ pub struct SendSettings {
 
 impl AppConfig {
     pub fn load() -> ConfigResult<Self> {
-        let Some(path) = config_file_path() else {
+        let Some(home) = user_home_dir() else {
             return Ok(Self::default());
         };
+        let path = config_file_path_from_home(&home);
         if !path.exists() {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(path)?;
-        Self::from_toml_str(&content)
+        let mut config = Self::from_toml_str(&content)?;
+        config.expand_paths(&home);
+        Ok(config)
     }
 
     pub fn from_toml_str(content: &str) -> ConfigResult<Self> {
         Ok(toml::from_str(content)?)
     }
+
+    fn expand_paths(&mut self, home: &Path) {
+        if let Some(download_dir) = &self.defaults.download_dir {
+            self.defaults.download_dir = Some(expand_tilde_path(download_dir, home));
+        }
+    }
 }
 
 impl EnvConfig {
     pub fn from_env() -> ConfigResult<Self> {
-        Self::from_pairs(env::vars())
+        let home = user_home_dir();
+        Self::from_pairs_with_home(env::vars(), home.as_deref())
     }
 
     pub fn from_pairs<I, K, V>(pairs: I) -> ConfigResult<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        Self::from_pairs_with_home(pairs, None)
+    }
+
+    pub fn from_pairs_with_home<I, K, V>(pairs: I, home: Option<&Path>) -> ConfigResult<Self>
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
@@ -120,7 +139,9 @@ impl EnvConfig {
             .collect();
 
         Ok(Self {
-            download_dir: values.get("LAN_SHARE_DIR").map(PathBuf::from),
+            download_dir: values
+                .get("LAN_SHARE_DIR")
+                .map(|value| expand_config_path(value, home)),
             port: parse_optional(values.get("LAN_SHARE_PORT"), "LAN_SHARE_PORT")?,
             name: values.get("LAN_SHARE_NAME").cloned(),
             bind_ip: values.get("LAN_SHARE_BIND_IP").cloned(),
@@ -148,8 +169,12 @@ impl EnvConfig {
     }
 }
 
+pub fn user_home_dir() -> Option<PathBuf> {
+    UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+}
+
 pub fn config_file_path() -> Option<PathBuf> {
-    UserDirs::new().map(|dirs| config_file_path_from_home(dirs.home_dir()))
+    user_home_dir().map(config_file_path_from_home)
 }
 
 pub fn config_file_path_from_home(home: impl AsRef<Path>) -> PathBuf {
@@ -159,17 +184,33 @@ pub fn config_file_path_from_home(home: impl AsRef<Path>) -> PathBuf {
         .join("config.toml")
 }
 
+pub fn expand_tilde_path(path: impl AsRef<Path>, home: &Path) -> PathBuf {
+    let path = path.as_ref();
+    let Some(path_str) = path.to_str() else {
+        return path.to_path_buf();
+    };
+
+    match path_str {
+        "~" => home.to_path_buf(),
+        value if value.starts_with("~/") || value.starts_with("~\\") => home.join(&value[2..]),
+        _ => path.to_path_buf(),
+    }
+}
+
 pub fn resolve_serve_settings(
+    home: &Path,
     cli: ConfigOverrides,
     env: &EnvConfig,
     config: &AppConfig,
 ) -> ServeSettings {
     ServeSettings {
-        download_dir: cli
-            .download_dir
-            .or_else(|| env.download_dir.clone())
-            .or_else(|| config.defaults.download_dir.clone())
-            .unwrap_or_else(|| PathBuf::from("./downloads")),
+        download_dir: expand_tilde_path(
+            cli.download_dir
+                .or_else(|| env.download_dir.clone())
+                .or_else(|| config.defaults.download_dir.clone())
+                .unwrap_or_else(|| PathBuf::from("./downloads")),
+            home,
+        ),
         port: cli
             .port
             .or(env.port)
@@ -240,6 +281,13 @@ pub fn resolve_send_settings(
             .or(env.concurrency)
             .or(config.defaults.concurrency)
             .unwrap_or(3),
+    }
+}
+
+fn expand_config_path(path: impl AsRef<Path>, home: Option<&Path>) -> PathBuf {
+    match home {
+        Some(home) => expand_tilde_path(path, home),
+        None => path.as_ref().to_path_buf(),
     }
 }
 
