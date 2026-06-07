@@ -74,7 +74,10 @@ pub async fn start_listener(registry: PeerRegistry) -> std::io::Result<()> {
     }
 }
 
-pub fn get_local_ips() -> Vec<String> {
+pub fn get_local_ips(bind_ip: Option<Ipv4Addr>) -> Vec<String> {
+    if let Some(ip) = bind_ip {
+        return vec![ip.to_string()];
+    }
     if let Ok(ip) = local_ip() {
         vec![ip.to_string()]
     } else {
@@ -127,5 +130,21 @@ mod tests {
         assert_eq!(list[0].uuid, "test-uuid-123");
 
         join_handle.abort();
+    }
+
+    #[test]
+    fn test_get_local_ips_with_bind_ip() {
+        use std::net::Ipv4Addr;
+        let ip = Ipv4Addr::new(192, 168, 1, 5);
+        let ips = get_local_ips(Some(ip));
+        assert_eq!(ips, vec!["192.168.1.5".to_string()]);
+    }
+
+    #[test]
+    fn test_get_local_ips_without_bind_ip() {
+        // None 时行为与原来一致：返回非空列表（有网络时）
+        let ips = get_local_ips(None);
+        // 只验证不 panic，不对具体值做断言（CI 环境 IP 不固定）
+        let _ = ips;
     }
 }
