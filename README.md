@@ -15,9 +15,7 @@
 
 ---
 
-## 🚀 快速上手
-
-### 1. 编译安装
+## 🚀 编译与安装
 
 在开始之前，请确保您的系统已安装 Rust 工具链。
 
@@ -26,68 +24,130 @@
 cargo build --release
 ```
 
-编译产物位于 `target/release/lan-share`。
+编译产物位于 `target/release/lan-share`。您可以将该可执行文件复制到系统的 `PATH` 路径下（如 `/usr/local/bin`）以方便全局调用。
 
-### 2. 启动服务（接收端）
+---
 
-在想要接收文件或消息的机器上启动服务模式：
+## 💻 所有使用方法
 
-```bash
-# 启动接收服务，默认监听 8080 端口并将接收的文件保存至 ./downloads
-./target/release/lan-share serve
-
-# 您可以自定义保存目录与初始端口
-./target/release/lan-share serve --dir ~/Downloads/LAN-Share --port 9000
-```
-*注：如果指定端口已被占用，服务会自动查找并递增绑定下一个可用端口（如 9001）。*
-
-### 3. 在线节点扫描（发送端）
-
-在另一台机器上，扫描当前局域网内的在线服务：
+### 1. 启动服务（接收端）
+使用 `serve` 命令启动本地监听。
 
 ```bash
-./target/release/lan-share peers
+lan-share serve [FLAGS]
 ```
 
-输出示例：
+**支持参数：**
+*   `--dir <DIR>`：指定接收文件的保存目录。默认值为当前目录下的 `./downloads`。
+*   `-p`, `--port <PORT>`：指定绑定的 TCP 端口。默认值为 `8080`。**若端口已被占用，程序会自动递增尝试下一个可用端口**（如 8081, 8082...）。
+*   `-n`, `--name <NAME>`：为本地节点设置一个局域网别名（Alias）。默认使用系统主机名。
+
+**示例：**
+```bash
+# 使用默认配置启动
+lan-share serve
+
+# 启动并设置别名为 "archlinux"，文件保存到 ~/Downloads/LAN-Share，从 9000 端口开始尝试绑定
+lan-share serve --name archlinux --dir ~/Downloads/LAN-Share --port 9000
+```
+
+---
+
+### 2. 扫描局域网节点
+使用 `peers` 命令扫描当前局域网中运行着 `lan-share serve` 的所有活动设备。
+
+```bash
+lan-share peers
+```
+
+**示例输出：**
 ```text
 Scanning local network for peers (listening for 1.5 seconds)...
 UUID                                 | Name                 | Port  | IPs
 --------------------------------------------------------------------------------
 fb741f93-6856-4a75-a760-4f723fefccb2 | archlinux            | 8080  | 192.168.100.155
-```
-
-### 4. 发送文字消息
-
-使用 `send-text` 子命令。其中 `--to` 目标可以传入**节点别名**（如 `archlinux`）、**UUID** 或 **IP:Port**：
-
-```bash
-./target/release/lan-share send-text --to archlinux "你好，局域网的伙伴！"
-```
-
-### 5. 发送文件
-
-使用 `send-file` 子命令直接传输文件：
-
-```bash
-./target/release/lan-share send-file --to archlinux ~/Downloads/report.pdf
+9ea6338f-c990-495e-83b3-74d958be324e | win11-laptop         | 8081  | 192.168.100.102
 ```
 
 ---
 
-## 🛠️ 命令帮助
+### 3. 发送文字消息
+使用 `send-text` 命令向局域网节点发送简短消息。
 
-```text
-A simple LAN file sharing tool
+```bash
+lan-share send-text --to <TARGET> [FLAGS] <TEXT>
+```
 
-Usage: lan-share <COMMAND>
+**支持参数：**
+*   `--to <TARGET>`（必需）：指定接收端目标。可以是**节点别名**（如 `archlinux`）、**UUID**、**IP地址**、**IP:Port** 或 **IPv6**。
+*   `-n`, `--name <SENDER_NAME>`：指定您的发送者署名。默认使用系统主机名。
+*   `<TEXT>`（位置参数）：要发送的文字消息内容，如有空格需用引号包裹。
 
-Commands:
-  serve      Start the file sharing server
-  peers      List all discovered online peers
-  send-text  Send a text message to a specific peer
-  send-file  Send a file to a specific peer
-  help       Print this message or the help of the given subcommand(s)
+**示例：**
+```bash
+# 发送给别名为 archlinux 的节点
+lan-share send-text --to archlinux "Hello from macOS"
+
+# 发送给直连 IP 且指定发送人名称为 Alice
+lan-share send-text --to 192.168.100.155:8080 --name Alice "这是文字测试"
+```
+
+---
+
+### 4. 发送本地文件
+使用 `send-file` 命令传输本地文件。
+
+```bash
+lan-share send-file --to <TARGET> [FLAGS] <FILE_PATH>
+```
+
+**支持参数：**
+*   `--to <TARGET>`（必需）：指定接收端目标。可以是**节点别名**、**UUID**、**IP地址**、**IP:Port** 或 **IPv6**。
+*   `-n`, `--name <SENDER_NAME>`：指定您的发送者署名。默认使用系统主机名。
+*   `<FILE_PATH>`（位置参数）：本地要发送的文件路径。
+
+**示例：**
+```bash
+# 发送本地 pdf 准考证文件给 archlinux 节点
+lan-share send-file --to archlinux ~/Downloads/ticket.pdf
+
+# 使用直连 IP 传输 zip 压缩包
+lan-share send-file --to 192.168.100.155:8080 ./archive.zip
+```
+
+---
+
+## 💡 推荐使用方法 (最佳实践)
+
+### 1. 设备别名动态发送 (最常推荐)
+在局域网内设备 IP 经常变动的无线 Wi-Fi 环境下，建议在启动服务时为设备起一个固定的别名（例如 `--name archlinux`）。
+发送时，直接使用 `--to archlinux`：
+```bash
+lan-share send-file --to archlinux ~/movie.mp4
+```
+**为什么推荐**：
+*   无需记忆随时可能变化的 IP。
+*   **毫秒级极速解析**：客户端底层内置了“动态轮询与提前退出”机制。一旦组播心跳捕获到该别名对应的 IP，会**立刻终止扫描并进行发送**，通常仅需 `50ms - 200ms` 的解析延迟。
+
+---
+
+### 2. IP:Port 直连绕过扫描 (0ms 延迟，适合自动化脚本)
+在已知对方物理地址（如 `192.168.100.155:8080` 或 `[::1]:8080`）的场景下，直接传递 `IP:Port` 作为参数。
+```bash
+lan-share send-file --to 192.168.100.155:8080 ~/movie.mp4
+```
+**为什么推荐**：
+*   **0ms 扫描时延**：程序检测到符合 `SocketAddr` 或 `IpAddr` 规范的直连地址时，将**完全跳过启动 UDP 监听和 2 秒扫描检测的过程**，直接建立 HTTP TCP 连接进行极速秒发。
+*   适合用于内网自动化脚本（如定时日志备份、编译产物分发）。
+
+---
+
+### 3. 跨网卡多 IP 环境直连建议
+当节点存在多块网卡（如同时开启 Wi-Fi、以太网和虚拟机 VPN 网卡）时，组播心跳会把所有可用的本地单播 IP 汇总广播给发送端。
+发送端会自动提取最匹配的物理 IP。如果因特殊网络策略无法自动解析，您可以利用 `peers` 查看到的指定 IP 手动指定目标直连：
+```bash
+# peers 返回的 IPs 表里包含了多个地址，挑选能连通的地址直连
+lan-share send-text --to 192.168.100.155:8080 "Hello"
 ```
 
 ---
