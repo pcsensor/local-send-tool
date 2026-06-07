@@ -53,6 +53,7 @@ struct UploadSession {
     chunk_size: u64,
     checksum: String,
     received_chunks: BTreeSet<u64>,
+    last_active: std::time::Instant,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +80,37 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
         download_dir,
         upload_sessions: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    let sessions = state.upload_sessions.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+
+            let mut dirs_to_remove = Vec::new();
+            {
+                let mut map = sessions.lock().await;
+                let now = std::time::Instant::now();
+                let timeout = tokio::time::Duration::from_secs(3600);
+
+                let stale_ids: Vec<String> = map
+                    .iter()
+                    .filter(|(_, session)| now.duration_since(session.last_active) > timeout)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+
+                for id in stale_ids {
+                    if let Some(session) = map.remove(&id) {
+                        dirs_to_remove.push(session.temp_dir);
+                    }
+                }
+            } // 锁在这里释放
+
+            for dir in dirs_to_remove {
+                let _ = tokio::fs::remove_dir_all(&dir).await;
+            }
+        }
+    });
+
     Router::new()
         .route(
             "/api/message",
@@ -265,14 +297,18 @@ async fn handle_file_init(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    if let Some(session) = state.upload_sessions.lock().await.get(&upload_id).cloned() {
-        if session.file_size != payload.file_size
-            || session.chunk_size != payload.chunk_size
-            || session.checksum != payload.checksum
-        {
-            return StatusCode::BAD_REQUEST.into_response();
+    {
+        let mut sessions = state.upload_sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&upload_id) {
+            if session.file_size != payload.file_size
+                || session.chunk_size != payload.chunk_size
+                || session.checksum != payload.checksum
+            {
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            session.last_active = std::time::Instant::now();
+            return Json(init_response(&upload_id, session)).into_response();
         }
-        return Json(init_response(&upload_id, &session)).into_response();
     }
 
     let final_path = available_download_path(&state.download_dir, &basename);
@@ -292,13 +328,15 @@ async fn handle_file_init(
         };
 
     let mut sessions = state.upload_sessions.lock().await;
-    let session = if let Some(existing) = sessions.get(&upload_id).cloned() {
+    let session = if let Some(mut existing) = sessions.get(&upload_id).cloned() {
         if existing.file_size != payload.file_size
             || existing.chunk_size != payload.chunk_size
             || existing.checksum != payload.checksum
         {
             return StatusCode::BAD_REQUEST.into_response();
         }
+        existing.last_active = std::time::Instant::now();
+        sessions.insert(upload_id.clone(), existing.clone());
         existing
     } else {
         let new_session = UploadSession {
@@ -309,6 +347,7 @@ async fn handle_file_init(
             chunk_size: payload.chunk_size,
             checksum: payload.checksum,
             received_chunks,
+            last_active: std::time::Instant::now(),
         };
         sessions.insert(upload_id.clone(), new_session.clone());
         new_session
@@ -347,6 +386,7 @@ async fn handle_file_chunk(
         Ok(written) => {
             if let Some(session) = state.upload_sessions.lock().await.get_mut(&upload_id) {
                 session.received_chunks.insert(index);
+                session.last_active = std::time::Instant::now();
             }
             Json(StandardResponse {
                 status: "success".to_string(),
@@ -1062,4 +1102,54 @@ mod tests {
             assert_eq!(response.status(), axum::http::StatusCode::OK);
         }
     }
+
+    #[tokio::test]
+    async fn test_stale_session_cleanup() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        
+        let upload_sessions = Arc::new(Mutex::new(HashMap::new()));
+        let _state = ServerState {
+            registry,
+            download_dir: tmp_dir.path().to_path_buf(),
+            upload_sessions: upload_sessions.clone(),
+        };
+        
+        let session_dir = tmp_dir.path().join(".dummy.chunks-stale-id");
+        tokio::fs::create_dir_all(&session_dir).await.unwrap();
+        
+        let stale_session = UploadSession {
+            sender_name: "stale-user".to_string(),
+            final_path: tmp_dir.path().join("dummy.txt"),
+            temp_dir: session_dir.clone(),
+            file_size: 1000,
+            chunk_size: 100,
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            received_chunks: BTreeSet::new(),
+            last_active: std::time::Instant::now() - std::time::Duration::from_secs(7200), // 2 小时前
+        };
+        
+        upload_sessions.lock().await.insert("stale-id".to_string(), stale_session);
+        assert!(session_dir.exists());
+        
+        // 模拟后台清理逻辑
+        let now = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(3600);
+        let mut map = upload_sessions.lock().await;
+        let stale_ids: Vec<String> = map
+            .iter()
+            .filter(|(_, session)| now.duration_since(session.last_active) > timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
+            
+        for id in stale_ids {
+            if let Some(session) = map.remove(&id) {
+                let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
+            }
+        }
+        
+        assert!(!map.contains_key("stale-id"));
+        assert!(!session_dir.exists(), "过期的隐藏临时文件夹应该已被彻底删除");
+    }
 }
+
