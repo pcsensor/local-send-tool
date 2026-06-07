@@ -55,28 +55,32 @@ enum Commands {
     },
 }
 
+async fn find_available_port(start_port: u16) -> (tokio::net::TcpListener, u16) {
+    let mut actual_port = start_port;
+    loop {
+        let addr = format!("0.0.0.0:{}", actual_port);
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => return (listener, actual_port),
+            Err(e) => {
+                println!(
+                    "Port {} is occupied (error: {}). Trying next port...",
+                    actual_port, e
+                );
+                if actual_port == u16::MAX {
+                    panic!("Failed to find any free port");
+                }
+                actual_port += 1;
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Serve { dir, port, name } => {
-            let mut actual_port = port;
-            let listener = loop {
-                let addr = format!("0.0.0.0:{}", actual_port);
-                match tokio::net::TcpListener::bind(&addr).await {
-                    Ok(l) => break l,
-                    Err(e) => {
-                        println!(
-                            "Port {} is occupied (error: {}). Trying next port...",
-                            actual_port, e
-                        );
-                        actual_port += 1;
-                        if actual_port == 0 {
-                            panic!("Failed to find any free port");
-                        }
-                    }
-                }
-            };
+            let (listener, actual_port) = find_available_port(port).await;
 
             let node_name = match name {
                 Some(n) => n,

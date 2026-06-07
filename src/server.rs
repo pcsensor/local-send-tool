@@ -96,34 +96,46 @@ async fn handle_file(
             };
 
             let mut final_path = state.download_dir.join(basename);
-            if final_path.exists() {
-                let path = std::path::Path::new(basename);
-                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let path = std::path::Path::new(basename);
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-                let mut counter = 1;
-                loop {
+            let mut file;
+            let mut counter = 0;
+
+            loop {
+                let current_path = if counter == 0 {
+                    final_path.clone()
+                } else {
                     let new_name = if extension.is_empty() {
                         format!("{}_{}", stem, counter)
                     } else {
                         format!("{}_{}.{}", stem, counter, extension)
                     };
-                    let check_path = state.download_dir.join(&new_name);
-                    if !check_path.exists() {
-                        final_path = check_path;
+                    state.download_dir.join(&new_name)
+                };
+
+                match tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&current_path)
+                    .await
+                {
+                    Ok(f) => {
+                        file = f;
+                        final_path = current_path;
                         break;
                     }
-                    counter += 1;
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::AlreadyExists {
+                            counter += 1;
+                        } else {
+                            eprintln!("Failed to create file: {}", e);
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                    }
                 }
             }
-
-            let mut file = match tokio::fs::File::create(&final_path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("Failed to create file: {}", e);
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
 
             use tokio::io::AsyncWriteExt;
             loop {

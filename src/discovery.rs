@@ -60,6 +60,7 @@ pub async fn start_listener(registry: PeerRegistry) -> std::io::Result<()> {
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::ConnectionReset {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                     continue;
                 }
                 eprintln!(
