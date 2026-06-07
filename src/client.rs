@@ -13,7 +13,6 @@ use std::{
     error::Error,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -193,6 +192,7 @@ struct ChunkUploadRequest {
     total_bytes: u64,
     chunk_size: u64,
     retry_attempts: usize,
+    sink: ProgressSink,
 }
 
 impl ChunkUploadRequest {
@@ -224,7 +224,9 @@ impl ChunkUploadRequest {
         let mut file = File::open(&self.file_path).await?;
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         let reader = file.take(chunk_bytes);
-        let stream = ReaderStream::with_capacity(reader, 64 * 1024);
+        // 包装成 ProgressReader
+        let progress_reader = ProgressReader::with_chunk_index(reader, self.sink.clone(), self.total_bytes, index);
+        let stream = ReaderStream::with_capacity(progress_reader, 64 * 1024);
         let body = Body::wrap_stream(stream);
         let url = format_url(
             &self.to_addr,
@@ -399,8 +401,7 @@ async fn send_file_chunked(
     let received_chunks: HashSet<u64> = init_response.received_chunks.into_iter().collect();
     println!("Chunked upload id: {}", init_response.upload_id);
     let chunk_count = total_bytes.div_ceil(chunk_size);
-    let progress = ProgressSink::new(options.progress.clone(), total_bytes);
-    let uploaded_bytes = Arc::new(AtomicU64::new(init_response.received_bytes));
+    let progress = ProgressSink::new_with_initial(options.progress.clone(), total_bytes, init_response.received_bytes);
     progress.report(init_response.received_bytes, total_bytes);
 
     let semaphore = Arc::new(Semaphore::new(options.chunk_concurrency.max(1)));
@@ -420,6 +421,7 @@ async fn send_file_chunked(
             total_bytes,
             chunk_size,
             retry_attempts: options.retry_attempts,
+            sink: progress.clone(),
         };
         handles.push(tokio::spawn(async move {
             let _permit = permit;
@@ -428,9 +430,7 @@ async fn send_file_chunked(
     }
 
     for handle in handles {
-        let chunk_bytes = handle.await??;
-        let sent = uploaded_bytes.fetch_add(chunk_bytes, Ordering::SeqCst) + chunk_bytes;
-        progress.report(sent.min(total_bytes), total_bytes);
+        handle.await??;
     }
 
     let complete_url = format_url(
