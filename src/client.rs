@@ -21,7 +21,9 @@ fn format_url(to_addr: &str, path: &str) -> String {
 
 pub async fn send_text(to_addr: &str, sender_name: &str, text: &str) -> Result<(), reqwest::Error> {
     let url = format_url(to_addr, "/api/message");
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
     let payload = MessagePayload { sender_name, text };
     
     let response = client.post(&url)
@@ -35,7 +37,9 @@ pub async fn send_text(to_addr: &str, sender_name: &str, text: &str) -> Result<(
 
 pub async fn send_file(to_addr: &str, sender_name: &str, file_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let url = format_url(to_addr, "/api/file");
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
     
     let form = Form::new()
         .text("sender_name", sender_name.to_string())

@@ -71,10 +71,9 @@ async fn handle_file(
     }
 
     let mut sender_name = String::new();
-    let mut file_name = None;
-    let mut file_bytes = None;
+    let mut saved_file_path = None;
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    while let Ok(Some(mut field)) = multipart.next_field().await {
         let name = match field.name() {
             Some(n) => n.to_string(),
             None => continue,
@@ -85,51 +84,77 @@ async fn handle_file(
                 sender_name = text;
             }
         } else if name == "file" {
-            if let Some(fname) = field.file_name() {
-                file_name = Some(fname.to_string());
-            }
-            if let Ok(bytes) = field.bytes().await {
-                file_bytes = Some(bytes);
-            }
-        }
-    }
-
-    let original_name = match file_name {
-        Some(name) if !name.is_empty() => name,
-        _ => return StatusCode::BAD_REQUEST.into_response(),
-    };
-
-    let bytes = match file_bytes {
-        Some(b) => b,
-        _ => return StatusCode::BAD_REQUEST.into_response(),
-    };
-
-    let mut final_path = state.download_dir.join(&original_name);
-    if final_path.exists() {
-        let path = std::path::Path::new(&original_name);
-        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-        let mut counter = 1;
-        loop {
-            let new_name = if extension.is_empty() {
-                format!("{}_{}", stem, counter)
-            } else {
-                format!("{}_{}.{}", stem, counter, extension)
+            let fname = match field.file_name() {
+                Some(fname) => fname,
+                None => return StatusCode::BAD_REQUEST.into_response(),
             };
-            let check_path = state.download_dir.join(&new_name);
-            if !check_path.exists() {
-                final_path = check_path;
-                break;
+
+            // 防范路径穿越安全漏洞
+            let basename = match std::path::Path::new(fname).file_name().and_then(|f| f.to_str()) {
+                Some(b) if !b.is_empty() => b,
+                _ => return StatusCode::BAD_REQUEST.into_response(),
+            };
+
+            let mut final_path = state.download_dir.join(basename);
+            if final_path.exists() {
+                let path = std::path::Path::new(basename);
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+                let mut counter = 1;
+                loop {
+                    let new_name = if extension.is_empty() {
+                        format!("{}_{}", stem, counter)
+                    } else {
+                        format!("{}_{}.{}", stem, counter, extension)
+                    };
+                    let check_path = state.download_dir.join(&new_name);
+                    if !check_path.exists() {
+                        final_path = check_path;
+                        break;
+                    }
+                    counter += 1;
+                }
             }
-            counter += 1;
+
+            let mut file = match tokio::fs::File::create(&final_path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Failed to create file: {}", e);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+
+            use tokio::io::AsyncWriteExt;
+            loop {
+                match field.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if let Err(e) = file.write_all(&chunk).await {
+                            eprintln!("Failed to write chunk: {}", e);
+                            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("Multipart error while reading chunk: {}", e);
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                }
+            }
+
+            if let Err(e) = file.sync_all().await {
+                eprintln!("Failed to sync file: {}", e);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+
+            saved_file_path = Some(final_path);
         }
     }
 
-    if let Err(e) = tokio::fs::write(&final_path, bytes).await {
-        eprintln!("Failed to write file: {}", e);
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    let final_path = match saved_file_path {
+        Some(path) => path,
+        None => return StatusCode::BAD_REQUEST.into_response(),
+    };
 
     println!(
         "\n[成功接收文件] 来自: {}, 保存至: {}",
