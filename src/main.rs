@@ -24,9 +24,17 @@ enum Commands {
         /// Peer name (alias) for this node
         #[arg(short, long)]
         name: Option<String>,
+
+        /// 指定局域网网卡 IP（开启 TUN 代理时使用，例如 192.168.1.5）
+        #[arg(long, value_name = "IP")]
+        bind_ip: Option<String>,
     },
     /// List all discovered online peers
-    Peers,
+    Peers {
+        /// 指定局域网网卡 IP（开启 TUN 代理时使用，例如 192.168.1.5）
+        #[arg(long, value_name = "IP")]
+        bind_ip: Option<String>,
+    },
     /// Send a text message to a specific peer
     SendText {
         /// The peer name, UUID, IP, or IP:Port to send to
@@ -39,6 +47,10 @@ enum Commands {
 
         /// The message text
         text: String,
+
+        /// 指定局域网网卡 IP（开启 TUN 代理时使用，例如 192.168.1.5）
+        #[arg(long, value_name = "IP")]
+        bind_ip: Option<String>,
     },
     /// Send a file to a specific peer
     SendFile {
@@ -52,6 +64,10 @@ enum Commands {
 
         /// Path to the file
         file: PathBuf,
+
+        /// 指定局域网网卡 IP（开启 TUN 代理时使用，例如 192.168.1.5）
+        #[arg(long, value_name = "IP")]
+        bind_ip: Option<String>,
     },
 }
 
@@ -73,6 +89,16 @@ async fn find_available_port(start_port: u16) -> (tokio::net::TcpListener, u16) 
             }
         }
     }
+}
+
+/// 将 --bind-ip 字符串解析为 Ipv4Addr，无效时打印错误并退出
+fn parse_bind_ip(bind_ip: Option<&str>) -> Option<std::net::Ipv4Addr> {
+    bind_ip.map(|s| {
+        s.parse::<std::net::Ipv4Addr>().unwrap_or_else(|_| {
+            eprintln!("错误：--bind-ip '{}' 不是有效的 IPv4 地址（示例：192.168.1.5）", s);
+            std::process::exit(1);
+        })
+    })
 }
 
 fn is_direct_address(addr: &str) -> bool {
@@ -110,7 +136,7 @@ fn fallback_address(to: &str) -> String {
     to.to_string()
 }
 
-async fn resolve_destination(to: &str) -> String {
+async fn resolve_destination(to: &str, bind_ip: Option<std::net::Ipv4Addr>) -> String {
     if is_direct_address(to) {
         return fallback_address(to);
     }
@@ -118,15 +144,13 @@ async fn resolve_destination(to: &str) -> String {
     let registry = lan_share::peer::PeerRegistry::new();
     let listener_registry = registry.clone();
 
-    // 启动接收
     let listen_handle = tokio::spawn(async move {
-        let _ = lan_share::discovery::start_listener(listener_registry).await;
+        let _ = lan_share::discovery::start_listener(listener_registry, bind_ip).await;
     });
 
     println!("Scanning for target '{}' in local network...", to);
 
     let mut found_peer = None;
-    // 每 50ms 轮询一次，最多等待 2.0 秒（40次）
     for _ in 0..40 {
         if let Some(peer) = registry.find_by_name_or_ip(to) {
             found_peer = Some(peer);
@@ -151,7 +175,7 @@ async fn resolve_destination(to: &str) -> String {
 async fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Serve { dir, port, name } => {
+        Commands::Serve { dir, port, name, bind_ip } => {
             let (listener, actual_port) = find_available_port(port).await;
 
             let node_name = match name {
@@ -162,12 +186,14 @@ async fn main() {
                     .unwrap_or_else(|| "Unknown-Node".to_string()),
             };
 
+            let bind_ip = parse_bind_ip(bind_ip.as_deref());
+
             let registry = lan_share::peer::PeerRegistry::new();
 
             // 1. 启动后台 UDP 心跳包接收并注册在线节点
             let listener_registry = registry.clone();
             tokio::spawn(async move {
-                if let Err(e) = lan_share::discovery::start_listener(listener_registry).await {
+                if let Err(e) = lan_share::discovery::start_listener(listener_registry, bind_ip).await {
                     eprintln!("Listener background task failed: {}", e);
                 }
             });
@@ -177,11 +203,11 @@ async fn main() {
                 uuid: uuid::Uuid::new_v4().to_string(),
                 name: node_name.clone(),
                 port: actual_port,
-                ips: lan_share::discovery::get_local_ips(),
+                ips: lan_share::discovery::get_local_ips(bind_ip),
             };
             let broadcaster_peer = peer.clone();
             tokio::spawn(async move {
-                if let Err(e) = lan_share::discovery::start_broadcaster(broadcaster_peer).await {
+                if let Err(e) = lan_share::discovery::start_broadcaster(broadcaster_peer, bind_ip).await {
                     eprintln!("Broadcaster background task failed: {}", e);
                 }
             });
@@ -196,13 +222,13 @@ async fn main() {
                 eprintln!("Server exited with error: {}", e);
             }
         }
-        Commands::Peers => {
+        Commands::Peers { bind_ip } => {
+            let bind_ip = parse_bind_ip(bind_ip.as_deref());
             let registry = lan_share::peer::PeerRegistry::new();
             let listener_registry = registry.clone();
 
-            // 启动 UDP 接收监听
             let listen_handle = tokio::spawn(async move {
-                let _ = lan_share::discovery::start_listener(listener_registry).await;
+                let _ = lan_share::discovery::start_listener(listener_registry, bind_ip).await;
             });
 
             println!("Scanning local network for peers (listening for 1.5 seconds)...");
@@ -226,8 +252,9 @@ async fn main() {
                 }
             }
         }
-        Commands::SendText { to, name, text } => {
-            let dest_addr = resolve_destination(&to).await;
+        Commands::SendText { to, name, text, bind_ip } => {
+            let bind_ip = parse_bind_ip(bind_ip.as_deref());
+            let dest_addr = resolve_destination(&to, bind_ip).await;
 
             let sender_name = match name {
                 Some(n) => n,
@@ -246,13 +273,14 @@ async fn main() {
                 }
             }
         }
-        Commands::SendFile { to, name, file } => {
+        Commands::SendFile { to, name, file, bind_ip } => {
             if !file.exists() {
                 eprintln!("Error: File '{}' does not exist.", file.display());
                 std::process::exit(1);
             }
 
-            let dest_addr = resolve_destination(&to).await;
+            let bind_ip = parse_bind_ip(bind_ip.as_deref());
+            let dest_addr = resolve_destination(&to, bind_ip).await;
 
             let sender_name = match name {
                 Some(n) => n,
@@ -301,8 +329,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_destination_direct() {
-        assert_eq!(resolve_destination("127.0.0.1:9000").await, "127.0.0.1:9000");
-        assert_eq!(resolve_destination("127.0.0.1").await, "127.0.0.1:8080");
+        assert_eq!(resolve_destination("127.0.0.1:9000", None).await, "127.0.0.1:9000");
+        assert_eq!(resolve_destination("127.0.0.1", None).await, "127.0.0.1:8080");
     }
 }
 
