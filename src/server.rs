@@ -291,22 +291,30 @@ async fn handle_file_init(
             }
         };
 
-    let session = UploadSession {
-        sender_name: payload.sender_name,
-        final_path,
-        temp_dir,
-        file_size: payload.file_size,
-        chunk_size: payload.chunk_size,
-        checksum: payload.checksum,
-        received_chunks,
+    let mut sessions = state.upload_sessions.lock().await;
+    let session = if let Some(existing) = sessions.get(&upload_id).cloned() {
+        if existing.file_size != payload.file_size
+            || existing.chunk_size != payload.chunk_size
+            || existing.checksum != payload.checksum
+        {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        existing
+    } else {
+        let new_session = UploadSession {
+            sender_name: payload.sender_name,
+            final_path,
+            temp_dir,
+            file_size: payload.file_size,
+            chunk_size: payload.chunk_size,
+            checksum: payload.checksum,
+            received_chunks,
+        };
+        sessions.insert(upload_id.clone(), new_session.clone());
+        new_session
     };
-    let response = init_response(&upload_id, &session);
-    state
-        .upload_sessions
-        .lock()
-        .await
-        .insert(upload_id, session);
 
+    let response = init_response(&upload_id, &session);
     Json(response).into_response()
 }
 
@@ -1017,5 +1025,41 @@ mod tests {
 
         let saved = std::fs::read_to_string(tmp_dir.path().join("resume.txt")).unwrap();
         assert_eq!(saved, "abcdef");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_handle_file_init() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+
+        let init_body = serde_json::json!({
+            "sender_name": "concurrent-sender",
+            "file_name": "concurrent.txt",
+            "file_size": 100,
+            "checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+            "chunk_size": 10,
+            "upload_id": "concurrent-test",
+        });
+
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let r = router.clone();
+            let body_str = init_body.to_string();
+            handles.push(tokio::spawn(async move {
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/file/init")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body_str))
+                    .unwrap();
+                r.oneshot(request).await.unwrap()
+            }));
+        }
+
+        for handle in handles {
+            let response = handle.await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+        }
     }
 }
