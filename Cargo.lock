@@ -769,6 +769,7 @@ dependencies = [
  "serde_json",
  "socket2",
  "tokio",
+ "tower",
  "tower-http 0.5.2",
  "uuid",
 ]

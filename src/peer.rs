@@ -75,8 +75,8 @@ impl PeerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn test_peer_serialization() {
@@ -123,7 +123,7 @@ mod tests {
 
         // Sleep for a tiny duration so that duration_since(last_seen) is positive.
         thread::sleep(Duration::from_millis(5));
-        
+
         // Clean stale with a duration of 1ms, it should clean the peer because it's been 5ms.
         registry.clean_stale(Duration::from_millis(1));
         assert_eq!(registry.list().len(), 0);
@@ -141,17 +141,26 @@ mod tests {
         registry.register(peer.clone());
 
         // Find by UUID
-        assert_eq!(registry.find_by_name_or_ip("peer-1-uuid"), Some(peer.clone()));
-        
+        assert_eq!(
+            registry.find_by_name_or_ip("peer-1-uuid"),
+            Some(peer.clone())
+        );
+
         // Find by Name
         assert_eq!(registry.find_by_name_or_ip("node-1"), Some(peer.clone()));
 
         // Find by IP
-        assert_eq!(registry.find_by_name_or_ip("192.168.1.100"), Some(peer.clone()));
+        assert_eq!(
+            registry.find_by_name_or_ip("192.168.1.100"),
+            Some(peer.clone())
+        );
         assert_eq!(registry.find_by_name_or_ip("10.0.0.1"), Some(peer.clone()));
 
         // Find by IP:Port
-        assert_eq!(registry.find_by_name_or_ip("192.168.1.100:8080"), Some(peer.clone()));
+        assert_eq!(
+            registry.find_by_name_or_ip("192.168.1.100:8080"),
+            Some(peer.clone())
+        );
 
         // Non-existent
         assert_eq!(registry.find_by_name_or_ip("non-existent"), None);
