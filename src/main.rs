@@ -76,16 +76,38 @@ async fn find_available_port(start_port: u16) -> (tokio::net::TcpListener, u16) 
 }
 
 fn is_direct_address(addr: &str) -> bool {
-    addr.parse::<std::net::SocketAddr>().is_ok() || addr.parse::<std::net::IpAddr>().is_ok()
+    if addr.parse::<std::net::SocketAddr>().is_ok() || addr.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if addr.starts_with('[') && addr.ends_with(']') {
+        let inner = &addr[1..addr.len() - 1];
+        if inner.parse::<std::net::Ipv6Addr>().is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 fn fallback_address(to: &str) -> String {
-    let is_ip = to.parse::<std::net::IpAddr>().is_ok();
-    if is_ip || !to.contains(':') {
-        format!("{}:8080", to)
-    } else {
-        to.to_string()
+    if let Ok(ip) = to.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(ip) => format!("{}:8080", ip),
+            std::net::IpAddr::V6(ip) => format!("[{}]:8080", ip),
+        };
     }
+    if to.parse::<std::net::SocketAddr>().is_ok() {
+        return to.to_string();
+    }
+    if to.starts_with('[') && to.ends_with(']') {
+        let inner = &to[1..to.len() - 1];
+        if inner.parse::<std::net::Ipv6Addr>().is_ok() {
+            return format!("{}:8080", to);
+        }
+    }
+    if !to.contains(':') {
+        return format!("{}:8080", to);
+    }
+    to.to_string()
 }
 
 async fn resolve_destination(to: &str) -> String {
@@ -262,6 +284,7 @@ mod tests {
         assert!(is_direct_address("[::1]:8080"));
         assert!(is_direct_address("127.0.0.1"));
         assert!(is_direct_address("::1"));
+        assert!(is_direct_address("[::1]"));
         assert!(!is_direct_address("localhost"));
         assert!(!is_direct_address("archlinux"));
     }
@@ -272,6 +295,8 @@ mod tests {
         assert_eq!(fallback_address("archlinux"), "archlinux:8080");
         assert_eq!(fallback_address("127.0.0.1:9000"), "127.0.0.1:9000");
         assert_eq!(fallback_address("example.com:9000"), "example.com:9000");
+        assert_eq!(fallback_address("::1"), "[::1]:8080");
+        assert_eq!(fallback_address("[::1]"), "[::1]:8080");
     }
 
     #[tokio::test]
