@@ -20,10 +20,6 @@ jobs:
             target: aarch64-apple-darwin
             artifact_name: lan-share-macos-arm64
             binary: lan-share
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact_name: lan-share-macos-x86_64
-            binary: lan-share
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: lan-share-windows-x86_64
