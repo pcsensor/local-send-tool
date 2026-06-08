@@ -8,21 +8,21 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.artifact_name }}
+    name: Build ${{ matrix.artifact_suffix }}
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: lan-share-linux-x86_64
+            artifact_suffix: linux-x86_64
             binary: lan-share
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: lan-share-macos-arm64
+            artifact_suffix: macos-arm64
             binary: lan-share
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: lan-share-windows-x86_64
+            artifact_suffix: windows-x86_64
             binary: lan-share.exe
 
     runs-on: ${{ matrix.os }}
@@ -42,31 +42,36 @@ jobs:
         if: runner.os != 'Windows'
         run: strip target/${{ matrix.target }}/release/${{ matrix.binary }}
 
+      - name: Set artifact name
+        id: artifact
+        shell: bash
+        run: echo "name=lan-share-${{ github.ref_name }}-${{ matrix.artifact_suffix }}" >> "$GITHUB_OUTPUT"
+
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ${{ github.workspace }}/${{ matrix.artifact_name }}.tar.gz ${{ matrix.binary }}
+          tar czf ${{ github.workspace }}/${{ steps.artifact.outputs.name }}.tar.gz ${{ matrix.binary }}
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ${{ github.workspace }}/${{ matrix.artifact_name }}.tar.gz ${{ matrix.binary }}
+          tar czf ${{ github.workspace }}/${{ steps.artifact.outputs.name }}.tar.gz ${{ matrix.binary }}
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         run: |
           cd target\${{ matrix.target }}\release
-          Compress-Archive -Path ${{ matrix.binary }} -DestinationPath ${{ github.workspace }}\${{ matrix.artifact_name }}.zip
+          Compress-Archive -Path ${{ matrix.binary }} -DestinationPath ${{ github.workspace }}\${{ steps.artifact.outputs.name }}.zip
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: ${{ steps.artifact.outputs.name }}
           path: |
-            ${{ matrix.artifact_name }}.tar.gz
-            ${{ matrix.artifact_name }}.zip
+            ${{ steps.artifact.outputs.name }}.tar.gz
+            ${{ steps.artifact.outputs.name }}.zip
           if-no-files-found: error
 
   release:
