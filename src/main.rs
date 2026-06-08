@@ -154,14 +154,20 @@ enum Commands {
     },
 }
 
-async fn find_available_port(bind_ip: Option<std::net::Ipv4Addr>, start_port: u16) -> (tokio::net::TcpListener, u16) {
+async fn find_available_port(
+    bind_ip: Option<std::net::Ipv4Addr>,
+    start_port: u16,
+) -> (tokio::net::TcpListener, u16) {
     let mut actual_port = start_port;
     let ip = bind_ip.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
     loop {
         let addr = std::net::SocketAddr::from((ip, actual_port));
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(listener) => {
-                let port = listener.local_addr().map(|a| a.port()).unwrap_or(actual_port);
+                let port = listener
+                    .local_addr()
+                    .map(|a| a.port())
+                    .unwrap_or(actual_port);
                 return (listener, port);
             }
             Err(e) => {
@@ -766,6 +772,10 @@ mod tests {
         let (listener, actual_port) = find_available_port(loopback_ip, 0).await;
         assert!(actual_port > 0, "自动分配的端口应大于 0");
         let local_addr = listener.local_addr().unwrap();
-        assert_eq!(local_addr.ip().to_string(), "127.0.0.1", "监听地址应仅为 127.0.0.1，而不是 0.0.0.0");
+        assert_eq!(
+            local_addr.ip().to_string(),
+            "127.0.0.1",
+            "监听地址应仅为 127.0.0.1，而不是 0.0.0.0"
+        );
     }
 }

@@ -9,10 +9,8 @@ pub const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 188);
 pub const MULTICAST_PORT: u16 = 50001;
 
 pub async fn broadcast_once(peer: &Peer, bind_ip: Option<Ipv4Addr>) -> std::io::Result<()> {
-    let bind_addr: std::net::SocketAddr = std::net::SocketAddr::from((
-        bind_ip.unwrap_or(Ipv4Addr::UNSPECIFIED),
-        0u16,
-    ));
+    let bind_addr: std::net::SocketAddr =
+        std::net::SocketAddr::from((bind_ip.unwrap_or(Ipv4Addr::UNSPECIFIED), 0u16));
     let socket = UdpSocket::bind(bind_addr).await?;
     let payload = serde_json::to_vec(peer)?;
     let target_addr: SocketAddr = format!("{}:{}", MULTICAST_ADDR, MULTICAST_PORT)
@@ -51,7 +49,10 @@ fn create_multicast_socket(bind_ip: Option<Ipv4Addr>) -> std::io::Result<StdUdpS
     Ok(StdUdpSocket::from(socket))
 }
 
-pub async fn start_listener(registry: PeerRegistry, bind_ip: Option<Ipv4Addr>) -> std::io::Result<()> {
+pub async fn start_listener(
+    registry: PeerRegistry,
+    bind_ip: Option<Ipv4Addr>,
+) -> std::io::Result<()> {
     let std_socket = create_multicast_socket(bind_ip)?;
     std_socket.set_nonblocking(true)?;
     let socket = UdpSocket::from_std(std_socket)?;
@@ -178,7 +179,10 @@ mod tests {
         let ips = get_local_ips(None);
         if !ips.is_empty() {
             for ip in &ips {
-                assert_ne!(ip, "127.0.0.1", "获取到的局域网 IP 列表中不应包含 Loopback 环回地址");
+                assert_ne!(
+                    ip, "127.0.0.1",
+                    "获取到的局域网 IP 列表中不应包含 Loopback 环回地址"
+                );
             }
         }
     }
@@ -188,7 +192,10 @@ mod tests {
         let ips = get_local_ips(None);
         if !ips.is_empty() {
             for ip in &ips {
-                assert_ne!(ip, "127.0.0.1", "获取到的局域网 IP 列表中不应包含 Loopback 环回地址");
+                assert_ne!(
+                    ip, "127.0.0.1",
+                    "获取到的局域网 IP 列表中不应包含 Loopback 环回地址"
+                );
             }
         }
     }

@@ -1,5 +1,3 @@
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
 use async_compression::tokio::bufread::ZstdEncoder;
 use clap::ValueEnum;
 use reqwest::{
@@ -8,6 +6,8 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::{
     collections::HashSet,
     error::Error,
@@ -195,6 +195,45 @@ struct ChunkUploadRequest {
     sink: ProgressSink,
 }
 
+struct ChunkedUploadCancelGuard {
+    client: Client,
+    to_addr: String,
+    upload_id: String,
+    completed: bool,
+}
+
+impl ChunkedUploadCancelGuard {
+    fn new(client: Client, to_addr: String, upload_id: String) -> Self {
+        Self {
+            client,
+            to_addr,
+            upload_id,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ChunkedUploadCancelGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+
+        let client = self.client.clone();
+        let url = format_url(
+            &self.to_addr,
+            &format!("/api/file/cancel/{}", self.upload_id),
+        );
+        tokio::spawn(async move {
+            let _ = client.delete(url).send().await;
+        });
+    }
+}
+
 impl ChunkUploadRequest {
     async fn upload_with_retry(&self, index: u64) -> Result<u64, DynError> {
         let mut attempt = 0;
@@ -225,7 +264,8 @@ impl ChunkUploadRequest {
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         let reader = file.take(chunk_bytes);
         // 包装成 ProgressReader
-        let progress_reader = ProgressReader::with_chunk_index(reader, self.sink.clone(), self.total_bytes, index);
+        let progress_reader =
+            ProgressReader::with_chunk_index(reader, self.sink.clone(), self.total_bytes, index);
         let stream = ReaderStream::with_capacity(progress_reader, 64 * 1024);
         let body = Body::wrap_stream(stream);
         let url = format_url(
@@ -278,7 +318,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
             let read = after.saturating_sub(before) as u64;
             if read > 0 {
                 self.sent_bytes += read;
-                self.sink.report_chunk(self.chunk_index, self.sent_bytes, self.total_bytes);
+                self.sink
+                    .report_chunk(self.chunk_index, self.sent_bytes, self.total_bytes);
             }
         }
         poll
@@ -400,8 +441,17 @@ async fn send_file_chunked(
 
     let received_chunks: HashSet<u64> = init_response.received_chunks.into_iter().collect();
     println!("Chunked upload id: {}", init_response.upload_id);
+    let mut cancel_guard = ChunkedUploadCancelGuard::new(
+        client.clone(),
+        to_addr.to_string(),
+        init_response.upload_id.clone(),
+    );
     let chunk_count = total_bytes.div_ceil(chunk_size);
-    let progress = ProgressSink::new_with_initial(options.progress.clone(), total_bytes, init_response.received_bytes);
+    let progress = ProgressSink::new_with_initial(
+        options.progress.clone(),
+        total_bytes,
+        init_response.received_bytes,
+    );
     progress.report(init_response.received_bytes, total_bytes);
 
     let semaphore = Arc::new(Semaphore::new(options.chunk_concurrency.max(1)));
@@ -442,6 +492,7 @@ async fn send_file_chunked(
         &format!("/api/file/complete/{}", init_response.upload_id),
     );
     client.post(complete_url).send().await?.error_for_status()?;
+    cancel_guard.complete();
     progress.finish(total_bytes);
     Ok(())
 }
@@ -621,7 +672,13 @@ mod tests {
     use super::*;
     use crate::peer::PeerRegistry;
     use crate::server::make_router;
-    use axum::{http::StatusCode, routing::post, Router};
+    use axum::{
+        extract::Path as AxumPath,
+        http::StatusCode,
+        routing::{delete, post, put},
+        Json, Router,
+    };
+    use serde_json::json;
     use std::sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -749,6 +806,90 @@ mod tests {
             .unwrap();
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_chunked_upload_abort_notifies_receiver_to_cancel() {
+        let source_dir = tempdir().unwrap();
+        let file_path = source_dir.path().join("abort.bin");
+        tokio::fs::write(&file_path, vec![b'x'; 128 * 1024])
+            .await
+            .unwrap();
+
+        let init_seen = Arc::new(AtomicUsize::new(0));
+        let cancel_seen = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/file/init",
+                post({
+                    let init_seen = Arc::clone(&init_seen);
+                    move || {
+                        let init_seen = Arc::clone(&init_seen);
+                        async move {
+                            init_seen.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({
+                                "upload_id": "abort-upload",
+                                "received_chunks": [],
+                                "received_bytes": 0,
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/file/chunk/:upload_id/:index",
+                put(|| async {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    StatusCode::OK
+                }),
+            )
+            .route(
+                "/api/file/cancel/:upload_id",
+                delete({
+                    let cancel_seen = Arc::clone(&cancel_seen);
+                    move |AxumPath(upload_id): AxumPath<String>| {
+                        let cancel_seen = Arc::clone(&cancel_seen);
+                        async move {
+                            assert_eq!(upload_id, "abort-upload");
+                            cancel_seen.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let options = FileSendOptions {
+            use_chunked: true,
+            chunk_size: 64 * 1024,
+            chunk_concurrency: 1,
+            ..FileSendOptions::default()
+        };
+        let upload = tokio::spawn({
+            let file_path = file_path.clone();
+            async move {
+                send_file_with_options(&server_addr, "client-sender", &file_path, options).await
+            }
+        });
+
+        while init_seen.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        upload.abort();
+
+        for _ in 0..100 {
+            if cancel_seen.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(cancel_seen.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

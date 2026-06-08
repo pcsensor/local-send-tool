@@ -4,7 +4,7 @@ use axum::{
     extract::{multipart::Field, DefaultBodyLimit, Multipart, Path as AxumPath, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{post, put},
+    routing::{delete, post, put},
     Json, Router,
 };
 use futures_util::stream;
@@ -133,11 +133,17 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
         )
         .route(
             "/api/file/chunk/:upload_id/:index",
-            put(handle_file_chunk).layer(tower_http::limit::RequestBodyLimitLayer::new(32 * 1024 * 1024)),
+            put(handle_file_chunk).layer(tower_http::limit::RequestBodyLimitLayer::new(
+                32 * 1024 * 1024,
+            )),
         )
         .route(
             "/api/file/complete/:upload_id",
             post(handle_file_complete).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/api/file/cancel/:upload_id",
+            delete(handle_file_cancel).layer(DefaultBodyLimit::max(1024 * 1024)),
         )
         .with_state(state)
 }
@@ -467,6 +473,25 @@ async fn handle_file_complete(
     }
 }
 
+async fn handle_file_cancel(
+    State(state): State<ServerState>,
+    AxumPath(upload_id): AxumPath<String>,
+) -> impl IntoResponse {
+    let session = state.upload_sessions.lock().await.remove(&upload_id);
+    let Some(session) = session else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
+    let _ = tokio::fs::remove_file(&session.final_path).await;
+
+    Json(StandardResponse {
+        status: "canceled".to_string(),
+        received_bytes: Some(received_bytes_for_chunks(&session)),
+    })
+    .into_response()
+}
+
 enum UploadError {
     BadRequest(String),
     Io(io::Error),
@@ -478,11 +503,16 @@ impl From<io::Error> for UploadError {
     }
 }
 
-
 async fn reserve_download_path(state: &ServerState, basename: &str) -> Result<PathBuf, StatusCode> {
     let original_path = Path::new(basename);
-    let stem = original_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let extension = original_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let stem = original_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let extension = original_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
     let mut counter = 0;
     loop {
         let candidate = if counter == 0 {
@@ -490,7 +520,9 @@ async fn reserve_download_path(state: &ServerState, basename: &str) -> Result<Pa
         } else if extension.is_empty() {
             state.download_dir.join(format!("{}_{}", stem, counter))
         } else {
-            state.download_dir.join(format!("{}_{}.{}", stem, counter, extension))
+            state
+                .download_dir
+                .join(format!("{}_{}.{}", stem, counter, extension))
         };
         match tokio::fs::OpenOptions::new()
             .write(true)
@@ -664,7 +696,6 @@ async fn save_chunk_inner(
         )));
     }
 
-    output.sync_all().await?;
     drop(output);
     tokio::fs::rename(temp_path, final_path).await?;
     Ok(written)
@@ -871,6 +902,49 @@ mod tests {
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_chunked_upload_removes_partial_session_files() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+        let upload_id = "cancel-me";
+        let checksum = sha256_hex(b"partial file");
+
+        let init_body = serde_json::json!({
+            "sender_name": "test-sender",
+            "file_name": "test.bin",
+            "file_size": 12,
+            "checksum": checksum,
+            "chunk_size": 6,
+            "upload_id": upload_id,
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/file/init")
+            .header("content-type", "application/json")
+            .body(Body::from(init_body.to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let temp_dir = tmp_dir.path().join(format!(".test.bin.chunks-{upload_id}"));
+        tokio::fs::write(temp_dir.join("chunk_0"), b"partia")
+            .await
+            .unwrap();
+        assert!(temp_dir.exists());
+        assert!(tmp_dir.path().join("test.bin").exists());
+
+        let request = Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/file/cancel/{upload_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!temp_dir.exists());
+        assert!(!tmp_dir.path().join("test.bin").exists());
     }
 
     #[tokio::test]
@@ -1155,34 +1229,38 @@ mod tests {
     async fn test_stale_session_cleanup() {
         let registry = PeerRegistry::new();
         let tmp_dir = tempdir().unwrap();
-        
+
         let upload_sessions = Arc::new(Mutex::new(HashMap::new()));
         let _state = ServerState {
             registry,
             download_dir: tmp_dir.path().to_path_buf(),
             upload_sessions: upload_sessions.clone(),
         };
-        
+
         let session_dir = tmp_dir.path().join(".dummy.chunks-stale-id");
         tokio::fs::create_dir_all(&session_dir).await.unwrap();
         let dummy_path = tmp_dir.path().join("dummy.txt");
         tokio::fs::File::create(&dummy_path).await.unwrap();
         assert!(dummy_path.exists());
-        
+
         let stale_session = UploadSession {
             sender_name: "stale-user".to_string(),
             final_path: dummy_path.clone(),
             temp_dir: session_dir.clone(),
             file_size: 1000,
             chunk_size: 100,
-            checksum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
             received_chunks: BTreeSet::new(),
             last_active: std::time::Instant::now() - std::time::Duration::from_secs(7200), // 2 小时前
         };
-        
-        upload_sessions.lock().await.insert("stale-id".to_string(), stale_session);
+
+        upload_sessions
+            .lock()
+            .await
+            .insert("stale-id".to_string(), stale_session);
         assert!(session_dir.exists());
-        
+
         // 模拟后台清理逻辑
         let now = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(3600);
@@ -1192,7 +1270,7 @@ mod tests {
             .filter(|(_, session)| now.duration_since(session.last_active) > timeout)
             .map(|(id, _)| id.clone())
             .collect();
-            
+
         let mut paths_to_remove = Vec::new();
         for id in stale_ids {
             if let Some(session) = map.remove(&id) {
@@ -1200,7 +1278,7 @@ mod tests {
             }
         }
         drop(map);
-        
+
         for (temp_dir, final_path) in paths_to_remove {
             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
             if final_path.exists() {
@@ -1211,10 +1289,16 @@ mod tests {
                 }
             }
         }
-        
+
         assert!(!upload_sessions.lock().await.contains_key("stale-id"));
-        assert!(!session_dir.exists(), "过期的隐藏临时文件夹应该已被彻底删除");
-        assert!(!dummy_path.exists(), "过期的隐藏临时占位文件应该已被彻底删除");
+        assert!(
+            !session_dir.exists(),
+            "过期的隐藏临时文件夹应该已被彻底删除"
+        );
+        assert!(
+            !dummy_path.exists(),
+            "过期的隐藏临时占位文件应该已被彻底删除"
+        );
     }
 
     #[tokio::test]
@@ -1222,17 +1306,19 @@ mod tests {
         let registry = PeerRegistry::new();
         let dir = tempdir().unwrap();
         let app = make_router(registry, dir.path().to_path_buf());
-        
+
         // 直接通过 init 初始化一个 session
         let init_req = InitUploadRequest {
             sender_name: "test".to_string(),
             file_name: "large.bin".to_string(),
             file_size: 100 * 1024 * 1024,
-            checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             chunk_size: 8 * 1024 * 1024,
             upload_id: Some("test-limit-id".to_string()),
         };
-        let response = app.clone()
+        let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1254,10 +1340,10 @@ mod tests {
                     .header("content-length", (33 * 1024 * 1024).to_string())
                     .body(Body::from(vec![0u8; 100]))
                     .unwrap(),
-                )
+            )
             .await
             .unwrap();
-        
+
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -1267,12 +1353,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let download_dir = dir.path().to_path_buf();
         let app = make_router(registry, download_dir.clone());
-        
+
         let payload1 = InitUploadRequest {
             sender_name: "client1".to_string(),
             file_name: "collision.txt".to_string(),
             file_size: 100,
-            checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             chunk_size: 100,
             upload_id: Some("id-1".to_string()),
         };
@@ -1280,18 +1367,19 @@ mod tests {
             sender_name: "client2".to_string(),
             file_name: "collision.txt".to_string(),
             file_size: 100,
-            checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+            checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
             chunk_size: 100,
             upload_id: Some("id-2".to_string()),
         };
-        
+
         let fut1 = app.clone().oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/file/init")
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&payload1).unwrap()))
-                .unwrap()
+                .unwrap(),
         );
         let fut2 = app.clone().oneshot(
             Request::builder()
@@ -1299,13 +1387,13 @@ mod tests {
                 .uri("/api/file/init")
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&payload2).unwrap()))
-                .unwrap()
+                .unwrap(),
         );
-        
+
         let (res1, res2) = tokio::join!(fut1, fut2);
         assert_eq!(res1.unwrap().status(), StatusCode::OK);
         assert_eq!(res2.unwrap().status(), StatusCode::OK);
-        
+
         // 验证两个占位文件都存在，证明两个并发请求分配到了不同的文件名
         assert!(download_dir.join("collision.txt").exists());
         assert!(download_dir.join("collision_1.txt").exists());
@@ -1330,7 +1418,8 @@ mod tests {
             upload_id: Some(upload_id.to_string()),
         };
 
-        let response = router.clone()
+        let response = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1358,12 +1447,8 @@ mod tests {
         let router1 = router.clone();
         let router2 = router.clone();
 
-        let fut1 = tokio::spawn(async move {
-            router1.oneshot(req1).await.unwrap()
-        });
-        let fut2 = tokio::spawn(async move {
-            router2.oneshot(req2).await.unwrap()
-        });
+        let fut1 = tokio::spawn(async move { router1.oneshot(req1).await.unwrap() });
+        let fut2 = tokio::spawn(async move { router2.oneshot(req2).await.unwrap() });
 
         let (res1, res2) = tokio::join!(fut1, fut2);
         let status1 = res1.unwrap().status();
@@ -1374,7 +1459,9 @@ mod tests {
         assert_eq!(status2, StatusCode::OK);
 
         // Verify that the final chunk file exists and has correct size and content
-        let session_temp_dir = tmp_dir.path().join(format!(".concurrent_chunk.txt.chunks-{}", upload_id));
+        let session_temp_dir = tmp_dir
+            .path()
+            .join(format!(".concurrent_chunk.txt.chunks-{}", upload_id));
         let chunk_file = session_temp_dir.join("chunk_0");
         assert!(chunk_file.exists());
         let saved_content = tokio::fs::read(&chunk_file).await.unwrap();
@@ -1387,49 +1474,53 @@ mod tests {
         let registry = PeerRegistry::new();
         let tmp_dir = tempdir().unwrap();
         let download_dir = tmp_dir.path().to_path_buf();
-        
+
         // 1. 模拟旧版将分片删除放在锁外的逻辑（即存在竞态条件）
         let upload_id = "race-test-id".to_string();
         let basename = "race.txt";
         let temp_dir = chunk_upload_dir(&download_dir, basename, &upload_id);
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();
-        
+
         let chunk_file = chunk_path(&temp_dir, 0);
         tokio::fs::write(&chunk_file, b"data").await.unwrap();
-        
+
         let final_path = download_dir.join(basename);
         tokio::fs::File::create(&final_path).await.unwrap();
-        
+
         let stale_session = UploadSession {
             sender_name: "sender".to_string(),
             final_path: final_path.clone(),
             temp_dir: temp_dir.clone(),
             file_size: 4,
             chunk_size: 4,
-            checksum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
             received_chunks: BTreeSet::new(),
             last_active: std::time::Instant::now() - std::time::Duration::from_secs(7200),
         };
-        
+
         let sessions = Arc::new(Mutex::new(HashMap::new()));
-        sessions.lock().await.insert(upload_id.clone(), stale_session);
+        sessions
+            .lock()
+            .await
+            .insert(upload_id.clone(), stale_session);
 
         let (tx_removed, rx_removed) = tokio::sync::oneshot::channel::<UploadSession>();
         let (tx_inited, rx_inited) = tokio::sync::oneshot::channel::<UploadSession>();
-        
+
         // 启动模拟旧版清理逻辑的 task
         let sessions_clone = sessions.clone();
         let cleanup_task = tokio::spawn(async move {
             let mut map = sessions_clone.lock().await;
             let session = map.remove("race-test-id").unwrap();
             drop(map); // 锁在此处被释放了
-            
+
             // 发送信号通知主线程：内存 map 已移除且锁已释放
             let _ = tx_removed.send(session);
-            
+
             // 等待主线程 init 完成的信号
             let session = rx_inited.await.unwrap();
-            
+
             // 开始物理删除
             let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
             if session.final_path.exists() {
@@ -1440,79 +1531,82 @@ mod tests {
                 }
             }
         });
-        
+
         // 等待清理线程把 map 移除并释放锁
         let session = rx_removed.await.unwrap();
-        
+
         let state = ServerState {
             registry: registry.clone(),
             download_dir: download_dir.clone(),
             upload_sessions: sessions.clone(),
         };
-        
+
         let payload = InitUploadRequest {
             sender_name: "sender".to_string(),
             file_name: basename.to_string(),
             file_size: 4,
-            checksum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
             chunk_size: 4,
             upload_id: Some(upload_id.clone()),
         };
-        
+
         // 客户端重新请求 init，此时会扫描并获取残留的分片
-        let _response = handle_file_init(
-            axum::extract::State(state.clone()),
-            Ok(axum::Json(payload)),
-        ).await;
-        
+        let _response =
+            handle_file_init(axum::extract::State(state.clone()), Ok(axum::Json(payload))).await;
+
         // 通知清理线程已完成 init，可以开始物理删除了
         let _ = tx_inited.send(session);
-        
+
         cleanup_task.await.unwrap();
-        
+
         // 验证竞态的发生：Session 中记录了分片 [0]，但磁盘上该分片却已被清理线程删除！
         let final_sessions = sessions.lock().await;
         let active_session = final_sessions.get("race-test-id").unwrap();
         assert!(active_session.received_chunks.contains(&0));
         assert!(!chunk_file.exists());
-        
+
         drop(final_sessions);
-        
+
         // 2. 模拟新版将分片删除放在锁内的逻辑（竞态被消除）
         let upload_id_safe = "race-test-id-safe".to_string();
         let temp_dir_safe = chunk_upload_dir(&download_dir, basename, &upload_id_safe);
         tokio::fs::create_dir_all(&temp_dir_safe).await.unwrap();
-        
+
         let chunk_file_safe = chunk_path(&temp_dir_safe, 0);
         tokio::fs::write(&chunk_file_safe, b"data").await.unwrap();
-        
+
         let final_path_safe = download_dir.join(format!("{}.safe", basename));
         tokio::fs::File::create(&final_path_safe).await.unwrap();
-        
+
         let stale_session_safe = UploadSession {
             sender_name: "sender".to_string(),
             final_path: final_path_safe.clone(),
             temp_dir: temp_dir_safe.clone(),
             file_size: 4,
             chunk_size: 4,
-            checksum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
             received_chunks: BTreeSet::new(),
             last_active: std::time::Instant::now() - std::time::Duration::from_secs(7200),
         };
-        
+
         let sessions_safe = Arc::new(Mutex::new(HashMap::new()));
-        sessions_safe.lock().await.insert(upload_id_safe.clone(), stale_session_safe);
-        
+        sessions_safe
+            .lock()
+            .await
+            .insert(upload_id_safe.clone(), stale_session_safe);
+
         let (tx_locked, rx_locked) = tokio::sync::oneshot::channel();
 
         // 启动模拟锁内清理的 task
         let sessions_safe_clone = sessions_safe.clone();
         let cleanup_task_safe = tokio::spawn(async move {
             let mut map = sessions_safe_clone.lock().await;
-            
+
             // 通知主线程：清理线程已锁定了 map 且正在处理中（此时锁尚未释放）
             let _ = tx_locked.send(());
-            
+
             if let Some(session) = map.remove("race-test-id-safe") {
                 // 物理删除和 map 移除均在锁持有期间发生
                 let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
@@ -1526,34 +1620,36 @@ mod tests {
             }
             // 锁在此处被释放
         });
-        
+
         // 等待清理线程锁定 map 并开始处理
         rx_locked.await.unwrap();
-        
+
         let state_safe = ServerState {
             registry: registry.clone(),
             download_dir: download_dir.clone(),
             upload_sessions: sessions_safe.clone(),
         };
-        
+
         let payload_safe = InitUploadRequest {
             sender_name: "sender".to_string(),
             file_name: format!("{}.safe", basename),
             file_size: 4,
-            checksum: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
             chunk_size: 4,
             upload_id: Some(upload_id_safe.clone()),
         };
-        
+
         // 客户端请求 init 动作，由于锁被 cleanup 持有而被阻塞。
         // 等它获得锁时，分片文件已被彻底删除，所以扫描不到任何分片。
         let _response_safe = handle_file_init(
             axum::extract::State(state_safe.clone()),
             Ok(axum::Json(payload_safe)),
-        ).await;
-        
+        )
+        .await;
+
         cleanup_task_safe.await.unwrap();
-        
+
         // 验证：新注册的 Session 中 received_chunks 是空的，避免了不一致的发生
         let final_sessions_safe = sessions_safe.lock().await;
         let active_session_safe = final_sessions_safe.get("race-test-id-safe").unwrap();
@@ -1561,6 +1657,3 @@ mod tests {
         assert!(!chunk_file_safe.exists());
     }
 }
-
-
-
