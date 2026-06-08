@@ -13,16 +13,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashMap},
+    future::Future,
     io,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::io::StreamReader;
 
-type UploadSessions = Arc<Mutex<HashMap<String, UploadSession>>>;
+type UploadSessions = Arc<Mutex<HashMap<String, UploadSessionEntry>>>;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -54,6 +55,12 @@ struct UploadSession {
     checksum: String,
     received_chunks: BTreeSet<u64>,
     last_active: std::time::Instant,
+}
+
+#[derive(Clone)]
+enum UploadSessionEntry {
+    Active(UploadSession),
+    Removing(Arc<Notify>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -90,31 +97,8 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
-
-            {
-                let mut map = sessions.lock().await;
-                let now = std::time::Instant::now();
-                let timeout = tokio::time::Duration::from_secs(3600);
-
-                let stale_ids: Vec<String> = map
-                    .iter()
-                    .filter(|(_, session)| now.duration_since(session.last_active) > timeout)
-                    .map(|(id, _)| id.clone())
-                    .collect();
-
-                for id in stale_ids {
-                    if let Some(session) = map.remove(&id) {
-                        let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
-                        if session.final_path.exists() {
-                            if let Ok(metadata) = tokio::fs::metadata(&session.final_path).await {
-                                if metadata.len() == 0 {
-                                    let _ = tokio::fs::remove_file(&session.final_path).await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            cleanup_stale_upload_sessions(sessions.clone(), tokio::time::Duration::from_secs(3600))
+                .await;
         }
     });
 
@@ -146,6 +130,97 @@ pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
             delete(handle_file_cancel).layer(DefaultBodyLimit::max(1024 * 1024)),
         )
         .with_state(state)
+}
+
+struct StaleUploadCleanup {
+    upload_id: String,
+    session: UploadSession,
+    notify: Arc<Notify>,
+}
+
+async fn cleanup_stale_upload_sessions(sessions: UploadSessions, timeout: std::time::Duration) {
+    cleanup_stale_upload_sessions_with(sessions, timeout, remove_upload_session_files).await;
+}
+
+async fn cleanup_stale_upload_sessions_with<F, Fut>(
+    sessions: UploadSessions,
+    timeout: std::time::Duration,
+    cleanup: F,
+) where
+    F: Fn(UploadSession) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let stale_sessions = take_stale_upload_sessions(&sessions, timeout).await;
+
+    for stale in stale_sessions {
+        cleanup(stale.session).await;
+        finish_stale_upload_cleanup(&sessions, &stale.upload_id, &stale.notify).await;
+    }
+}
+
+async fn take_stale_upload_sessions(
+    sessions: &UploadSessions,
+    timeout: std::time::Duration,
+) -> Vec<StaleUploadCleanup> {
+    let mut map = sessions.lock().await;
+    let now = std::time::Instant::now();
+    let stale_ids: Vec<String> = map
+        .iter()
+        .filter_map(|(id, entry)| match entry {
+            UploadSessionEntry::Active(session)
+                if now.duration_since(session.last_active) > timeout =>
+            {
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut stale_sessions = Vec::with_capacity(stale_ids.len());
+    for id in stale_ids {
+        let Some(UploadSessionEntry::Active(session)) = map.remove(&id) else {
+            continue;
+        };
+        let notify = Arc::new(Notify::new());
+        map.insert(id.clone(), UploadSessionEntry::Removing(notify.clone()));
+        stale_sessions.push(StaleUploadCleanup {
+            upload_id: id,
+            session,
+            notify,
+        });
+    }
+
+    stale_sessions
+}
+
+async fn finish_stale_upload_cleanup(
+    sessions: &UploadSessions,
+    upload_id: &str,
+    notify: &Arc<Notify>,
+) {
+    let mut map = sessions.lock().await;
+    if matches!(
+        map.get(upload_id),
+        Some(UploadSessionEntry::Removing(existing)) if Arc::ptr_eq(existing, notify)
+    ) {
+        map.remove(upload_id);
+    }
+    drop(map);
+    notify.notify_waiters();
+}
+
+async fn remove_upload_session_files(session: UploadSession) {
+    let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
+    if tokio::fs::try_exists(&session.final_path)
+        .await
+        .unwrap_or(false)
+    {
+        if let Ok(metadata) = tokio::fs::metadata(&session.final_path).await {
+            if metadata.len() == 0 {
+                let _ = tokio::fs::remove_file(&session.final_path).await;
+            }
+        }
+    }
 }
 
 async fn handle_message(
@@ -319,70 +394,104 @@ async fn handle_file_init(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    {
+    loop {
+        let wait_for_cleanup = {
+            let mut sessions = state.upload_sessions.lock().await;
+            match sessions.get_mut(&upload_id) {
+                Some(UploadSessionEntry::Active(session)) => {
+                    if session.file_size != payload.file_size
+                        || session.chunk_size != payload.chunk_size
+                        || session.checksum != payload.checksum
+                    {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    session.last_active = std::time::Instant::now();
+                    return Json(init_response(&upload_id, session)).into_response();
+                }
+                Some(UploadSessionEntry::Removing(notify)) => Some(notify.clone()),
+                None => None,
+            }
+        };
+        if let Some(notify) = wait_for_cleanup {
+            notify.notified().await;
+            continue;
+        }
+
+        let final_path = match reserve_download_path(&state, &basename).await {
+            Ok(path) => path,
+            Err(status) => return status.into_response(),
+        };
+        let temp_dir = chunk_upload_dir(&state.download_dir, &basename, &upload_id);
+        if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
+            eprintln!("Failed to create upload temp directory: {}", e);
+            let _ = tokio::fs::remove_file(&final_path).await;
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+
+        let received_chunks =
+            match scan_received_chunks(&temp_dir, payload.file_size, payload.chunk_size).await {
+                Ok(chunks) => chunks,
+                Err(e) => {
+                    eprintln!("Failed to scan upload temp directory: {}", e);
+                    let _ = tokio::fs::remove_file(&final_path).await;
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+
+        let mut placeholder_to_remove = None;
         let mut sessions = state.upload_sessions.lock().await;
-        if let Some(session) = sessions.get_mut(&upload_id) {
-            if session.file_size != payload.file_size
-                || session.chunk_size != payload.chunk_size
-                || session.checksum != payload.checksum
-            {
-                return StatusCode::BAD_REQUEST.into_response();
+        let session_result = match sessions.get_mut(&upload_id) {
+            Some(UploadSessionEntry::Active(existing)) => {
+                placeholder_to_remove = Some(final_path);
+                if existing.file_size != payload.file_size
+                    || existing.chunk_size != payload.chunk_size
+                    || existing.checksum != payload.checksum
+                {
+                    Err(StatusCode::BAD_REQUEST)
+                } else {
+                    existing.last_active = std::time::Instant::now();
+                    Ok(existing.clone())
+                }
             }
-            session.last_active = std::time::Instant::now();
-            return Json(init_response(&upload_id, session)).into_response();
-        }
-    }
-
-    let final_path = match reserve_download_path(&state, &basename).await {
-        Ok(path) => path,
-        Err(status) => return status.into_response(),
-    };
-    let temp_dir = chunk_upload_dir(&state.download_dir, &basename, &upload_id);
-    if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
-        eprintln!("Failed to create upload temp directory: {}", e);
-        let _ = tokio::fs::remove_file(&final_path).await;
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    let received_chunks =
-        match scan_received_chunks(&temp_dir, payload.file_size, payload.chunk_size).await {
-            Ok(chunks) => chunks,
-            Err(e) => {
-                eprintln!("Failed to scan upload temp directory: {}", e);
+            Some(UploadSessionEntry::Removing(notify)) => {
+                let notify = notify.clone();
+                drop(sessions);
                 let _ = tokio::fs::remove_file(&final_path).await;
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                notify.notified().await;
+                continue;
+            }
+            None => {
+                let new_session = UploadSession {
+                    sender_name: payload.sender_name.clone(),
+                    final_path,
+                    temp_dir,
+                    file_size: payload.file_size,
+                    chunk_size: payload.chunk_size,
+                    checksum: payload.checksum.clone(),
+                    received_chunks,
+                    last_active: std::time::Instant::now(),
+                };
+                sessions.insert(
+                    upload_id.clone(),
+                    UploadSessionEntry::Active(new_session.clone()),
+                );
+                Ok(new_session)
             }
         };
+        drop(sessions);
 
-    let mut sessions = state.upload_sessions.lock().await;
-    let session = if let Some(mut existing) = sessions.get(&upload_id).cloned() {
-        let _ = tokio::fs::remove_file(&final_path).await;
-        if existing.file_size != payload.file_size
-            || existing.chunk_size != payload.chunk_size
-            || existing.checksum != payload.checksum
-        {
-            return StatusCode::BAD_REQUEST.into_response();
+        if let Some(path) = placeholder_to_remove {
+            let _ = tokio::fs::remove_file(path).await;
         }
-        existing.last_active = std::time::Instant::now();
-        sessions.insert(upload_id.clone(), existing.clone());
-        existing
-    } else {
-        let new_session = UploadSession {
-            sender_name: payload.sender_name,
-            final_path,
-            temp_dir,
-            file_size: payload.file_size,
-            chunk_size: payload.chunk_size,
-            checksum: payload.checksum,
-            received_chunks,
-            last_active: std::time::Instant::now(),
-        };
-        sessions.insert(upload_id.clone(), new_session.clone());
-        new_session
-    };
 
-    let response = init_response(&upload_id, &session);
-    Json(response).into_response()
+        let session = match session_result {
+            Ok(session) => session,
+            Err(status) => return status.into_response(),
+        };
+
+        let response = init_response(&upload_id, &session);
+        return Json(response).into_response();
+    }
 }
 
 async fn handle_file_chunk(
@@ -391,8 +500,9 @@ async fn handle_file_chunk(
     body: Body,
 ) -> impl IntoResponse {
     let session = match state.upload_sessions.lock().await.get(&upload_id).cloned() {
-        Some(session) => session,
+        Some(UploadSessionEntry::Active(session)) => session,
         None => return StatusCode::NOT_FOUND.into_response(),
+        Some(UploadSessionEntry::Removing(_)) => return StatusCode::NOT_FOUND.into_response(),
     };
 
     let expected_chunks = chunk_count(session.file_size, session.chunk_size);
@@ -403,7 +513,9 @@ async fn handle_file_chunk(
     let expected_bytes = chunk_len(session.file_size, session.chunk_size, index);
     let chunk_path = chunk_path(&session.temp_dir, index);
     if chunk_path.exists() {
-        if let Some(session) = state.upload_sessions.lock().await.get_mut(&upload_id) {
+        if let Some(UploadSessionEntry::Active(session)) =
+            state.upload_sessions.lock().await.get_mut(&upload_id)
+        {
             session.received_chunks.insert(index);
             session.last_active = std::time::Instant::now();
         }
@@ -416,7 +528,9 @@ async fn handle_file_chunk(
 
     match save_chunk(body, &session.temp_dir, index, expected_bytes).await {
         Ok(written) => {
-            if let Some(session) = state.upload_sessions.lock().await.get_mut(&upload_id) {
+            if let Some(UploadSessionEntry::Active(session)) =
+                state.upload_sessions.lock().await.get_mut(&upload_id)
+            {
                 session.received_chunks.insert(index);
                 session.last_active = std::time::Instant::now();
             }
@@ -450,8 +564,9 @@ async fn handle_file_complete(
     AxumPath(upload_id): AxumPath<String>,
 ) -> impl IntoResponse {
     let session = match state.upload_sessions.lock().await.get(&upload_id).cloned() {
-        Some(session) => session,
+        Some(UploadSessionEntry::Active(session)) => session,
         None => return StatusCode::NOT_FOUND.into_response(),
+        Some(UploadSessionEntry::Removing(_)) => return StatusCode::NOT_FOUND.into_response(),
     };
 
     let expected_chunks = chunk_count(session.file_size, session.chunk_size);
@@ -461,7 +576,14 @@ async fn handle_file_complete(
 
     match complete_chunked_upload(&session).await {
         Ok(()) => {
-            state.upload_sessions.lock().await.remove(&upload_id);
+            let mut sessions = state.upload_sessions.lock().await;
+            if matches!(
+                sessions.get(&upload_id),
+                Some(UploadSessionEntry::Active(_))
+            ) {
+                sessions.remove(&upload_id);
+            }
+            drop(sessions);
             let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
             println!(
                 "\n[成功接收分片文件] 来自: {}, 保存至: {}",
@@ -490,7 +612,20 @@ async fn handle_file_cancel(
     State(state): State<ServerState>,
     AxumPath(upload_id): AxumPath<String>,
 ) -> impl IntoResponse {
-    let session = state.upload_sessions.lock().await.remove(&upload_id);
+    let session = {
+        let mut sessions = state.upload_sessions.lock().await;
+        if matches!(
+            sessions.get(&upload_id),
+            Some(UploadSessionEntry::Active(_))
+        ) {
+            match sessions.remove(&upload_id) {
+                Some(UploadSessionEntry::Active(session)) => Some(session),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    };
     let Some(session) = session else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1352,40 +1487,17 @@ mod tests {
             last_active: std::time::Instant::now() - std::time::Duration::from_secs(7200), // 2 小时前
         };
 
-        upload_sessions
-            .lock()
-            .await
-            .insert("stale-id".to_string(), stale_session);
+        upload_sessions.lock().await.insert(
+            "stale-id".to_string(),
+            UploadSessionEntry::Active(stale_session),
+        );
         assert!(session_dir.exists());
 
-        // 模拟后台清理逻辑
-        let now = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(3600);
-        let mut map = upload_sessions.lock().await;
-        let stale_ids: Vec<String> = map
-            .iter()
-            .filter(|(_, session)| now.duration_since(session.last_active) > timeout)
-            .map(|(id, _)| id.clone())
-            .collect();
-
-        let mut paths_to_remove = Vec::new();
-        for id in stale_ids {
-            if let Some(session) = map.remove(&id) {
-                paths_to_remove.push((session.temp_dir, session.final_path));
-            }
-        }
-        drop(map);
-
-        for (temp_dir, final_path) in paths_to_remove {
-            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-            if final_path.exists() {
-                if let Ok(metadata) = tokio::fs::metadata(&final_path).await {
-                    if metadata.len() == 0 {
-                        let _ = tokio::fs::remove_file(&final_path).await;
-                    }
-                }
-            }
-        }
+        cleanup_stale_upload_sessions(
+            upload_sessions.clone(),
+            std::time::Duration::from_secs(3600),
+        )
+        .await;
 
         assert!(!upload_sessions.lock().await.contains_key("stale-id"));
         assert!(
@@ -1396,6 +1508,71 @@ mod tests {
             !dummy_path.exists(),
             "过期的隐藏临时占位文件应该已被彻底删除"
         );
+    }
+
+    #[tokio::test]
+    async fn test_stale_session_cleanup_does_not_hold_lock_during_file_removal() {
+        let tmp_dir = tempdir().unwrap();
+        let upload_sessions = Arc::new(Mutex::new(HashMap::new()));
+        let session_dir = tmp_dir.path().join(".dummy.chunks-stale-lock");
+        tokio::fs::create_dir_all(&session_dir).await.unwrap();
+        let dummy_path = tmp_dir.path().join("dummy-lock.txt");
+        tokio::fs::File::create(&dummy_path).await.unwrap();
+
+        let stale_session = UploadSession {
+            sender_name: "stale-user".to_string(),
+            final_path: dummy_path,
+            temp_dir: session_dir,
+            file_size: 1000,
+            chunk_size: 100,
+            checksum: "0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+            received_chunks: BTreeSet::new(),
+            last_active: std::time::Instant::now() - std::time::Duration::from_secs(7200),
+        };
+
+        upload_sessions.lock().await.insert(
+            "stale-lock".to_string(),
+            UploadSessionEntry::Active(stale_session),
+        );
+
+        let cleanup_started = Arc::new(tokio::sync::Notify::new());
+        let release_cleanup = Arc::new(tokio::sync::Notify::new());
+        let sessions_for_cleanup = upload_sessions.clone();
+        let sessions_for_assertion = upload_sessions.clone();
+        let cleanup_started_for_task = cleanup_started.clone();
+        let release_cleanup_for_task = release_cleanup.clone();
+
+        let cleanup_task = tokio::spawn(async move {
+            cleanup_stale_upload_sessions_with(
+                sessions_for_cleanup,
+                std::time::Duration::from_secs(3600),
+                move |_session| {
+                    let cleanup_started = cleanup_started_for_task.clone();
+                    let release_cleanup = release_cleanup_for_task.clone();
+                    let sessions_for_assertion = sessions_for_assertion.clone();
+                    async move {
+                        cleanup_started.notify_waiters();
+                        let guard = tokio::time::timeout(
+                            std::time::Duration::from_millis(100),
+                            sessions_for_assertion.lock(),
+                        )
+                        .await
+                        .expect(
+                            "cleanup must not hold the upload_sessions lock while removing files",
+                        );
+                        drop(guard);
+                        release_cleanup.notified().await;
+                    }
+                },
+            )
+            .await;
+        });
+
+        cleanup_started.notified().await;
+        release_cleanup.notify_waiters();
+        cleanup_task.await.unwrap();
+        assert!(!upload_sessions.lock().await.contains_key("stale-lock"));
     }
 
     #[tokio::test]
@@ -1600,7 +1777,7 @@ mod tests {
         sessions
             .lock()
             .await
-            .insert(upload_id.clone(), stale_session);
+            .insert(upload_id.clone(), UploadSessionEntry::Active(stale_session));
 
         let (tx_removed, rx_removed) = tokio::sync::oneshot::channel::<UploadSession>();
         let (tx_inited, rx_inited) = tokio::sync::oneshot::channel::<UploadSession>();
@@ -1609,7 +1786,10 @@ mod tests {
         let sessions_clone = sessions.clone();
         let cleanup_task = tokio::spawn(async move {
             let mut map = sessions_clone.lock().await;
-            let session = map.remove("race-test-id").unwrap();
+            let session = match map.remove("race-test-id").unwrap() {
+                UploadSessionEntry::Active(session) => session,
+                UploadSessionEntry::Removing(_) => panic!("unexpected removing session"),
+            };
             drop(map); // 锁在此处被释放了
 
             // 发送信号通知主线程：内存 map 已移除且锁已释放
@@ -1659,7 +1839,10 @@ mod tests {
 
         // 验证竞态的发生：Session 中记录了分片 [0]，但磁盘上该分片却已被清理线程删除！
         let final_sessions = sessions.lock().await;
-        let active_session = final_sessions.get("race-test-id").unwrap();
+        let active_session = match final_sessions.get("race-test-id").unwrap() {
+            UploadSessionEntry::Active(session) => session,
+            UploadSessionEntry::Removing(_) => panic!("unexpected removing session"),
+        };
         assert!(active_session.received_chunks.contains(&0));
         assert!(!chunk_file.exists());
 
@@ -1689,37 +1872,37 @@ mod tests {
         };
 
         let sessions_safe = Arc::new(Mutex::new(HashMap::new()));
-        sessions_safe
-            .lock()
-            .await
-            .insert(upload_id_safe.clone(), stale_session_safe);
+        sessions_safe.lock().await.insert(
+            upload_id_safe.clone(),
+            UploadSessionEntry::Active(stale_session_safe),
+        );
 
-        let (tx_locked, rx_locked) = tokio::sync::oneshot::channel();
+        let cleanup_started = Arc::new(tokio::sync::Notify::new());
+        let release_cleanup = Arc::new(tokio::sync::Notify::new());
 
-        // 启动模拟锁内清理的 task
+        // 启动新版清理逻辑：锁内只标记 Removing，物理删除在锁外执行。
         let sessions_safe_clone = sessions_safe.clone();
+        let cleanup_started_for_task = cleanup_started.clone();
+        let release_cleanup_for_task = release_cleanup.clone();
         let cleanup_task_safe = tokio::spawn(async move {
-            let mut map = sessions_safe_clone.lock().await;
-
-            // 通知主线程：清理线程已锁定了 map 且正在处理中（此时锁尚未释放）
-            let _ = tx_locked.send(());
-
-            if let Some(session) = map.remove("race-test-id-safe") {
-                // 物理删除和 map 移除均在锁持有期间发生
-                let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
-                if session.final_path.exists() {
-                    if let Ok(metadata) = tokio::fs::metadata(&session.final_path).await {
-                        if metadata.len() == 0 {
-                            let _ = tokio::fs::remove_file(&session.final_path).await;
-                        }
+            cleanup_stale_upload_sessions_with(
+                sessions_safe_clone,
+                std::time::Duration::from_secs(3600),
+                move |session| {
+                    let cleanup_started = cleanup_started_for_task.clone();
+                    let release_cleanup = release_cleanup_for_task.clone();
+                    async move {
+                        cleanup_started.notify_waiters();
+                        release_cleanup.notified().await;
+                        remove_upload_session_files(session).await;
                     }
-                }
-            }
-            // 锁在此处被释放
+                },
+            )
+            .await;
         });
 
-        // 等待清理线程锁定 map 并开始处理
-        rx_locked.await.unwrap();
+        // 等待清理线程进入物理删除阶段，此时全局 map 锁已经释放，但该 upload_id 仍有 Removing tombstone。
+        cleanup_started.notified().await;
 
         let state_safe = ServerState {
             registry: registry.clone(),
@@ -1737,19 +1920,32 @@ mod tests {
             upload_id: Some(upload_id_safe.clone()),
         };
 
-        // 客户端请求 init 动作，由于锁被 cleanup 持有而被阻塞。
-        // 等它获得锁时，分片文件已被彻底删除，所以扫描不到任何分片。
-        let _response_safe = handle_file_init(
-            axum::extract::State(state_safe.clone()),
-            Ok(axum::Json(payload_safe)),
-        )
-        .await;
+        // 客户端请求 init 动作不会被全局锁阻塞，但会等待同 upload_id 的 tombstone 清理完成。
+        let init_task = tokio::spawn(async move {
+            handle_file_init(
+                axum::extract::State(state_safe),
+                Ok(axum::Json(payload_safe)),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !init_task.is_finished(),
+            "init should wait for cleanup of the same upload_id before scanning chunks"
+        );
+
+        release_cleanup.notify_waiters();
+        let _response_safe = init_task.await.unwrap();
 
         cleanup_task_safe.await.unwrap();
 
         // 验证：新注册的 Session 中 received_chunks 是空的，避免了不一致的发生
         let final_sessions_safe = sessions_safe.lock().await;
-        let active_session_safe = final_sessions_safe.get("race-test-id-safe").unwrap();
+        let active_session_safe = match final_sessions_safe.get("race-test-id-safe").unwrap() {
+            UploadSessionEntry::Active(session) => session,
+            UploadSessionEntry::Removing(_) => panic!("unexpected removing session"),
+        };
         assert!(active_session_safe.received_chunks.is_empty());
         assert!(!chunk_file_safe.exists());
     }

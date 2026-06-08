@@ -21,7 +21,7 @@ use std::{
 use tokio::{
     fs::File,
     io::{AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader, ReadBuf},
-    sync::Semaphore,
+    task::JoinSet,
 };
 use tokio_util::io::ReaderStream;
 
@@ -522,26 +522,67 @@ pub async fn send_files(
     concurrency: usize,
     options: FileSendOptions,
 ) -> Result<(), DynError> {
-    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
-    let mut handles = Vec::with_capacity(files.len());
+    let mut pending_files = files.iter().cloned();
+    let mut uploads = JoinSet::new();
+    let concurrency = concurrency.max(1);
 
-    for file_path in files {
-        let file_path = file_path.clone();
-        let permit = Arc::clone(&semaphore).acquire_owned().await?;
-        let to_addr = to_addr.to_string();
-        let sender_name = sender_name.to_string();
-        let options = options.clone();
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            send_file_with_options(&to_addr, &sender_name, &file_path, options).await
-        }));
+    for _ in 0..concurrency {
+        let Some(file_path) = pending_files.next() else {
+            break;
+        };
+        spawn_file_upload(
+            &mut uploads,
+            to_addr,
+            sender_name,
+            file_path,
+            options.clone(),
+        );
     }
 
-    for handle in handles {
-        handle.await??;
+    while let Some(result) = uploads.join_next().await {
+        match result {
+            Ok(Ok(())) => {
+                if let Some(file_path) = pending_files.next() {
+                    spawn_file_upload(
+                        &mut uploads,
+                        to_addr,
+                        sender_name,
+                        file_path,
+                        options.clone(),
+                    );
+                }
+            }
+            Ok(Err(err)) => {
+                abort_remaining_uploads(&mut uploads).await;
+                return Err(err);
+            }
+            Err(err) => {
+                abort_remaining_uploads(&mut uploads).await;
+                return Err(Box::new(err));
+            }
+        }
     }
 
     Ok(())
+}
+
+fn spawn_file_upload(
+    uploads: &mut JoinSet<Result<(), DynError>>,
+    to_addr: &str,
+    sender_name: &str,
+    file_path: PathBuf,
+    options: FileSendOptions,
+) {
+    let to_addr = to_addr.to_string();
+    let sender_name = sender_name.to_string();
+    uploads.spawn(async move {
+        send_file_with_options(&to_addr, &sender_name, &file_path, options).await
+    });
+}
+
+async fn abort_remaining_uploads(uploads: &mut JoinSet<Result<(), DynError>>) {
+    uploads.abort_all();
+    while uploads.join_next().await.is_some() {}
 }
 
 async fn send_file_once(
@@ -1035,6 +1076,124 @@ mod tests {
                 .unwrap(),
             "second"
         );
+    }
+
+    #[tokio::test]
+    async fn test_send_files_aborts_in_flight_uploads_after_failure() {
+        let source_dir = tempdir().unwrap();
+        let slow_file = source_dir.path().join("slow.bin");
+        let fail_file = source_dir.path().join("fail.bin");
+        tokio::fs::write(&slow_file, vec![b's'; 1024])
+            .await
+            .unwrap();
+        tokio::fs::write(&fail_file, vec![b'f'; 1024])
+            .await
+            .unwrap();
+
+        let slow_chunk_started = Arc::new(AtomicUsize::new(0));
+        let slow_chunk_started_notify = Arc::new(tokio::sync::Notify::new());
+        let cancel_seen = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/file/init",
+                post(|Json(payload): Json<serde_json::Value>| async move {
+                    let file_name = payload
+                        .get("file_name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let upload_id = if file_name == "slow.bin" {
+                        "slow-upload"
+                    } else {
+                        "fail-upload"
+                    };
+                    let chunk_size = payload
+                        .get("chunk_size")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(1024);
+                    Json(json!({
+                        "upload_id": upload_id,
+                        "chunk_size": chunk_size,
+                        "received_chunks": [],
+                        "received_bytes": 0,
+                    }))
+                }),
+            )
+            .route(
+                "/api/file/chunk/:upload_id/:index",
+                put({
+                    let slow_chunk_started = Arc::clone(&slow_chunk_started);
+                    let slow_chunk_started_notify = Arc::clone(&slow_chunk_started_notify);
+                    move |AxumPath((upload_id, _index)): AxumPath<(String, u64)>| {
+                        let slow_chunk_started = Arc::clone(&slow_chunk_started);
+                        let slow_chunk_started_notify = Arc::clone(&slow_chunk_started_notify);
+                        async move {
+                            if upload_id == "slow-upload" {
+                                slow_chunk_started.store(1, Ordering::SeqCst);
+                                slow_chunk_started_notify.notify_waiters();
+                                std::future::pending::<StatusCode>().await
+                            } else {
+                                while slow_chunk_started.load(Ordering::SeqCst) == 0 {
+                                    slow_chunk_started_notify.notified().await;
+                                }
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/file/cancel/:upload_id",
+                delete({
+                    let cancel_seen = Arc::clone(&cancel_seen);
+                    move |AxumPath(upload_id): AxumPath<String>| {
+                        let cancel_seen = Arc::clone(&cancel_seen);
+                        async move {
+                            if upload_id == "slow-upload" {
+                                cancel_seen.fetch_add(1, Ordering::SeqCst);
+                            }
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let options = FileSendOptions {
+            use_chunked: true,
+            chunk_size: 1024,
+            chunk_concurrency: 1,
+            ..FileSendOptions::default()
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            send_files(
+                &server_addr,
+                "client-sender",
+                &[slow_file.clone(), fail_file.clone()],
+                2,
+                options,
+            ),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "send_files should return the first failure instead of waiting for another in-flight upload"
+        );
+
+        for _ in 0..20 {
+            if cancel_seen.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(cancel_seen.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
