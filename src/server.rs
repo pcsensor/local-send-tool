@@ -262,6 +262,10 @@ async fn handle_file(
                     let _ = tokio::fs::remove_file(&final_path).await;
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                 }
+                Err(UploadError::ClientDisconnected) => {
+                    let _ = tokio::fs::remove_file(&final_path).await;
+                    return client_closed_request().into_response();
+                }
             }
         }
     }
@@ -437,6 +441,7 @@ async fn handle_file_chunk(
             eprintln!("Failed to save chunk: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+        Err(UploadError::ClientDisconnected) => client_closed_request().into_response(),
     }
 }
 
@@ -477,6 +482,7 @@ async fn handle_file_complete(
             eprintln!("Failed to complete chunked upload: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+        Err(UploadError::ClientDisconnected) => client_closed_request().into_response(),
     }
 }
 
@@ -501,6 +507,7 @@ async fn handle_file_cancel(
 
 enum UploadError {
     BadRequest(String),
+    ClientDisconnected,
     Io(io::Error),
 }
 
@@ -547,6 +554,10 @@ async fn reserve_download_path(state: &ServerState, basename: &str) -> Result<Pa
             }
         }
     }
+}
+
+fn client_closed_request() -> StatusCode {
+    StatusCode::from_u16(499).expect("499 is a valid non-standard HTTP status code")
 }
 
 fn temp_upload_path(download_dir: &Path, basename: &str) -> PathBuf {
@@ -680,7 +691,7 @@ async fn save_chunk_inner(
     let mut written = 0;
 
     while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let frame = frame.map_err(|_| UploadError::ClientDisconnected)?;
         let Some(data) = frame.data_ref() else {
             continue;
         };
@@ -860,6 +871,7 @@ mod tests {
     use crate::peer::PeerRegistry;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use bytes::Bytes;
     use http_body_util::BodyExt;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
@@ -989,6 +1001,47 @@ mod tests {
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_chunk_body_disconnect_returns_client_closed_request() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+        let upload_id = "body-disconnect";
+        let checksum = sha256_hex(b"partial file");
+
+        let init_body = serde_json::json!({
+            "sender_name": "test-sender",
+            "file_name": "test.bin",
+            "file_size": 12,
+            "checksum": checksum,
+            "chunk_size": 12,
+            "upload_id": upload_id,
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/file/init")
+            .header("content-type", "application/json")
+            .body(Body::from(init_body.to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let disconnecting_body = Body::from_stream(stream::once(async {
+            Err::<Bytes, io::Error>(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "error reading a body from connection",
+            ))
+        }));
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/file/chunk/{upload_id}/0"))
+            .body(disconnecting_body)
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::from_u16(499).unwrap());
     }
 
     #[tokio::test]
