@@ -1,5 +1,6 @@
 use async_compression::tokio::bufread::ZstdEncoder;
 use clap::ValueEnum;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::{
     multipart::{Form, Part},
     Body, Client,
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::{
     collections::HashSet,
     error::Error,
+    future::Future,
     path::{Path, PathBuf},
     pin::Pin,
     task::{Context, Poll},
@@ -24,6 +26,7 @@ use tokio::{
 use tokio_util::io::ReaderStream;
 
 type DynError = Box<dyn Error + Send + Sync>;
+type ChunkUploadFuture = Pin<Box<dyn Future<Output = Result<u64, DynError>> + Send>>;
 
 #[derive(Serialize)]
 struct MessagePayload<'a> {
@@ -454,15 +457,14 @@ async fn send_file_chunked(
     );
     progress.report(init_response.received_bytes, total_bytes);
 
-    let semaphore = Arc::new(Semaphore::new(options.chunk_concurrency.max(1)));
-    let mut handles = Vec::new();
+    let mut pending_chunks = (0..chunk_count).filter(|index| !received_chunks.contains(index));
+    let concurrency = options.chunk_concurrency.max(1);
+    let mut uploads: FuturesUnordered<ChunkUploadFuture> = FuturesUnordered::new();
 
-    for index in 0..chunk_count {
-        if received_chunks.contains(&index) {
-            continue;
-        }
-
-        let permit = Arc::clone(&semaphore).acquire_owned().await?;
+    for _ in 0..concurrency {
+        let Some(index) = pending_chunks.next() else {
+            break;
+        };
         let upload = ChunkUploadRequest {
             client: client.clone(),
             to_addr: to_addr.to_string(),
@@ -473,14 +475,30 @@ async fn send_file_chunked(
             retry_attempts: options.retry_attempts,
             sink: progress.clone(),
         };
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            upload.upload_with_retry(index).await
-        }));
+        uploads.push(Box::pin(
+            async move { upload.upload_with_retry(index).await },
+        ));
     }
 
-    for handle in handles {
-        handle.await??;
+    while let Some(result) = uploads.next().await {
+        result?;
+
+        let Some(index) = pending_chunks.next() else {
+            continue;
+        };
+        let upload = ChunkUploadRequest {
+            client: client.clone(),
+            to_addr: to_addr.to_string(),
+            upload_id: init_response.upload_id.clone(),
+            file_path: file_path.to_path_buf(),
+            total_bytes,
+            chunk_size,
+            retry_attempts: options.retry_attempts,
+            sink: progress.clone(),
+        };
+        uploads.push(Box::pin(
+            async move { upload.upload_with_retry(index).await },
+        ));
     }
 
     if let ProgressMode::Indicatif = options.progress {
@@ -890,6 +908,91 @@ mod tests {
         }
 
         assert_eq!(cancel_seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_chunked_upload_abort_stops_in_flight_chunk_retries() {
+        let source_dir = tempdir().unwrap();
+        let file_path = source_dir.path().join("abort-retries.bin");
+        tokio::fs::write(&file_path, vec![b'x'; 64 * 1024])
+            .await
+            .unwrap();
+
+        let chunk_attempts = Arc::new(AtomicUsize::new(0));
+        let cancel_seen = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/api/file/init",
+                post(|| async {
+                    Json(json!({
+                        "upload_id": "abort-retries-upload",
+                        "received_chunks": [],
+                        "received_bytes": 0,
+                    }))
+                }),
+            )
+            .route(
+                "/api/file/chunk/:upload_id/:index",
+                put({
+                    let chunk_attempts = Arc::clone(&chunk_attempts);
+                    move || {
+                        let chunk_attempts = Arc::clone(&chunk_attempts);
+                        async move {
+                            chunk_attempts.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/file/cancel/:upload_id",
+                delete({
+                    let cancel_seen = Arc::clone(&cancel_seen);
+                    move || {
+                        let cancel_seen = Arc::clone(&cancel_seen);
+                        async move {
+                            cancel_seen.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let options = FileSendOptions {
+            retry_attempts: 3,
+            use_chunked: true,
+            chunk_size: 64 * 1024,
+            chunk_concurrency: 1,
+            ..FileSendOptions::default()
+        };
+        let upload = tokio::spawn({
+            let file_path = file_path.clone();
+            async move {
+                send_file_with_options(&server_addr, "client-sender", &file_path, options).await
+            }
+        });
+
+        while chunk_attempts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        upload.abort();
+
+        for _ in 0..100 {
+            if cancel_seen.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert_eq!(cancel_seen.load(Ordering::SeqCst), 1);
+        assert_eq!(chunk_attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

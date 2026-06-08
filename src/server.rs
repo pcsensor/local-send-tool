@@ -427,6 +427,13 @@ async fn handle_file_chunk(
             StatusCode::BAD_REQUEST.into_response()
         }
         Err(UploadError::Io(e)) => {
+            if e.kind() == io::ErrorKind::NotFound
+                && !tokio::fs::try_exists(&session.temp_dir)
+                    .await
+                    .unwrap_or(false)
+            {
+                return StatusCode::NOT_FOUND.into_response();
+            }
             eprintln!("Failed to save chunk: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -945,6 +952,43 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!temp_dir.exists());
         assert!(!tmp_dir.path().join("test.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn test_missing_chunk_temp_directory_returns_not_found() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+        let upload_id = "missing-temp-dir";
+        let checksum = sha256_hex(b"partial file");
+
+        let init_body = serde_json::json!({
+            "sender_name": "test-sender",
+            "file_name": "test.bin",
+            "file_size": 12,
+            "checksum": checksum,
+            "chunk_size": 12,
+            "upload_id": upload_id,
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/file/init")
+            .header("content-type", "application/json")
+            .body(Body::from(init_body.to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let temp_dir = tmp_dir.path().join(format!(".test.bin.chunks-{upload_id}"));
+        tokio::fs::remove_dir_all(&temp_dir).await.unwrap();
+
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/api/file/chunk/{upload_id}/0"))
+            .body(Body::from("partial file"))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
