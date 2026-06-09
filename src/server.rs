@@ -708,11 +708,7 @@ fn chunk_path(temp_dir: &Path, index: u64) -> PathBuf {
 }
 
 fn chunk_count(file_size: u64, chunk_size: u64) -> u64 {
-    if file_size == 0 {
-        1
-    } else {
-        file_size.div_ceil(chunk_size)
-    }
+    file_size.div_ceil(chunk_size.max(1))
 }
 
 fn chunk_len(file_size: u64, chunk_size: u64, index: u64) -> u64 {

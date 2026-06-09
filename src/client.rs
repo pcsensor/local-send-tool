@@ -1228,4 +1228,36 @@ mod tests {
             .unwrap();
         assert_eq!(saved, content);
     }
+
+    #[tokio::test]
+    async fn test_send_empty_file_chunked() {
+        let registry = PeerRegistry::new();
+        let download_dir = tempdir().unwrap();
+        let source_dir = tempdir().unwrap();
+        let router = make_router(registry, download_dir.path().to_path_buf());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let file_path = source_dir.path().join("empty.txt");
+        tokio::fs::write(&file_path, "").await.unwrap();
+
+        let options = FileSendOptions {
+            use_chunked: true,
+            chunk_size: 1024,
+            chunk_concurrency: 1,
+            ..FileSendOptions::default()
+        };
+        send_file_with_options(&server_addr, "client-sender", &file_path, options)
+            .await
+            .unwrap();
+
+        let saved = tokio::fs::read_to_string(download_dir.path().join("empty.txt"))
+            .await
+            .unwrap();
+        assert_eq!(saved, "");
+    }
 }
