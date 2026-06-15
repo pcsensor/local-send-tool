@@ -152,6 +152,20 @@ enum Commands {
         #[arg(long)]
         chunk_concurrency: Option<usize>,
     },
+    /// Launch the interactive TUI (Discord-style chat interface)
+    Tui {
+        /// Port to bind the HTTP server
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Peer name (alias) for this node
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// 指定局域网网卡 IP（开启 TUN 代理时使用，例如 192.168.1.5）
+        #[arg(long, value_name = "IP")]
+        bind_ip: Option<String>,
+    },
 }
 
 async fn find_available_port(
@@ -611,6 +625,30 @@ async fn main() {
                     tokio::time::sleep(cancel_timeout).await;
                     std::process::exit(130);
                 }
+            }
+        }
+        Commands::Tui {
+            port,
+            name,
+            bind_ip,
+        } => {
+            let settings = lan_share::config::resolve_serve_settings(
+                &required_home_dir(),
+                lan_share::config::ConfigOverrides {
+                    port,
+                    name,
+                    bind_ip,
+                    ..lan_share::config::ConfigOverrides::default()
+                },
+                &env_config,
+                &app_config,
+            );
+            let bind_ip = parse_bind_ip(settings.bind_ip.as_deref());
+            let actual_port = settings.port;
+
+            if let Err(e) = lan_share::tui::run_tui(app_config, bind_ip, actual_port).await {
+                eprintln!("TUI error: {}", e);
+                std::process::exit(1);
             }
         }
     }

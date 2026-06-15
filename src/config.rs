@@ -1,6 +1,6 @@
 use crate::client::CompressionMode;
 use directories::UserDirs;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env,
@@ -10,13 +10,13 @@ use std::{
 
 type ConfigResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub defaults: ConfigDefaults,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ConfigDefaults {
     pub download_dir: Option<PathBuf>,
     pub port: Option<u16>,

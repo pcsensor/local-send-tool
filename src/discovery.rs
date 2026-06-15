@@ -42,11 +42,33 @@ fn create_multicast_socket(bind_ip: Option<Ipv4Addr>) -> std::io::Result<StdUdpS
 
     socket.bind(&bind_addr.into())?;
 
-    // bind_addr 是 socket 绑定的本地端口（用于接收数据）
-    // iface 是加入组播组的网卡接口 IP（决定从哪块网卡收组播包）
-    let iface = bind_ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
+    let iface = match bind_ip {
+        Some(ip) => ip,
+        None => auto_multicast_iface()?,
+    };
     socket.join_multicast_v4(&MULTICAST_ADDR, &iface)?;
     Ok(StdUdpSocket::from(socket))
+}
+
+fn auto_multicast_iface() -> std::io::Result<Ipv4Addr> {
+    if let Ok(ip) = local_ip() {
+        if let std::net::IpAddr::V4(v4) = ip {
+            return Ok(v4);
+        }
+    }
+    if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
+        for (_, ip) in interfaces {
+            if ip.is_ipv4() && !ip.is_loopback() {
+                if let std::net::IpAddr::V4(v4) = ip {
+                    return Ok(v4);
+                }
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrNotAvailable,
+        "无法自动确定组播网卡 IP，请通过 --bind-ip 指定",
+    ))
 }
 
 pub async fn start_listener(

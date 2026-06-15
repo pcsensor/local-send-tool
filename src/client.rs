@@ -43,6 +43,32 @@ pub enum CompressionMode {
     Never,
 }
 
+impl std::fmt::Display for CompressionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompressionMode::Auto => write!(f, "auto"),
+            CompressionMode::Always => write!(f, "always"),
+            CompressionMode::Never => write!(f, "never"),
+        }
+    }
+}
+
+impl std::str::FromStr for CompressionMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(CompressionMode::Auto),
+            "always" => Ok(CompressionMode::Always),
+            "never" => Ok(CompressionMode::Never),
+            other => Err(format!(
+                "Invalid compression mode '{}'; expected auto, always, or never",
+                other
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TransferProgress {
     pub sent_bytes: u64,

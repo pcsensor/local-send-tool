@@ -1,4 +1,5 @@
 use crate::peer::PeerRegistry;
+use crate::tui::TuiEvent;
 use axum::{
     body::Body,
     extract::{multipart::Field, DefaultBodyLimit, Multipart, Path as AxumPath, State},
@@ -20,6 +21,7 @@ use std::{
     sync::Arc,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::io::StreamReader;
 
@@ -30,6 +32,7 @@ pub struct ServerState {
     pub registry: PeerRegistry,
     pub download_dir: PathBuf,
     upload_sessions: UploadSessions,
+    event_tx: Option<UnboundedSender<TuiEvent>>,
 }
 
 #[derive(Deserialize)]
@@ -82,10 +85,19 @@ struct InitUploadResponse {
 }
 
 pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
+    make_router_with_events(registry, download_dir, None)
+}
+
+pub fn make_router_with_events(
+    registry: PeerRegistry,
+    download_dir: PathBuf,
+    event_tx: Option<UnboundedSender<TuiEvent>>,
+) -> Router {
     let state = ServerState {
         registry,
         download_dir,
         upload_sessions: Arc::new(Mutex::new(HashMap::new())),
+        event_tx,
     };
 
     #[cfg(target_pointer_width = "64")]
@@ -224,7 +236,7 @@ async fn remove_upload_session_files(session: UploadSession) {
 }
 
 async fn handle_message(
-    State(_state): State<ServerState>,
+    State(state): State<ServerState>,
     payload: Result<Json<MessagePayload>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     let Json(payload) = match payload {
@@ -235,6 +247,12 @@ async fn handle_message(
         "\n[收到来自 {} 的文字消息]: {}",
         payload.sender_name, payload.text
     );
+    if let Some(tx) = &state.event_tx {
+        let _ = tx.send(TuiEvent::MessageReceived {
+            sender: payload.sender_name.clone(),
+            text: payload.text.clone(),
+        });
+    }
     Json(StandardResponse {
         status: "success".to_string(),
         received_bytes: None,
@@ -350,11 +368,25 @@ async fn handle_file(
         None => return StatusCode::BAD_REQUEST.into_response(),
     };
 
+    let file_name = final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
     println!(
         "\n[成功接收文件] 来自: {}, 保存至: {}",
         sender_name,
         final_path.display()
     );
+
+    if let Some(tx) = &state.event_tx {
+        let _ = tx.send(TuiEvent::FileReceived {
+            sender: sender_name.clone(),
+            file_name,
+            file_size: received_bytes,
+        });
+    }
 
     Json(StandardResponse {
         status: "success".to_string(),
@@ -585,11 +617,27 @@ async fn handle_file_complete(
             }
             drop(sessions);
             let _ = tokio::fs::remove_dir_all(&session.temp_dir).await;
+
+            let file_name = session
+                .final_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
             println!(
                 "\n[成功接收分片文件] 来自: {}, 保存至: {}",
                 session.sender_name,
                 session.final_path.display()
             );
+
+            if let Some(tx) = &state.event_tx {
+                let _ = tx.send(TuiEvent::FileReceived {
+                    sender: session.sender_name.clone(),
+                    file_name,
+                    file_size: session.file_size,
+                });
+            }
             Json(StandardResponse {
                 status: "success".to_string(),
                 received_bytes: Some(session.file_size),
@@ -1463,6 +1511,7 @@ mod tests {
             registry,
             download_dir: tmp_dir.path().to_path_buf(),
             upload_sessions: upload_sessions.clone(),
+            event_tx: None,
         };
 
         let session_dir = tmp_dir.path().join(".dummy.chunks-stale-id");
@@ -1812,6 +1861,7 @@ mod tests {
             registry: registry.clone(),
             download_dir: download_dir.clone(),
             upload_sessions: sessions.clone(),
+            event_tx: None,
         };
 
         let payload = InitUploadRequest {
@@ -1904,6 +1954,7 @@ mod tests {
             registry: registry.clone(),
             download_dir: download_dir.clone(),
             upload_sessions: sessions_safe.clone(),
+            event_tx: None,
         };
 
         let payload_safe = InitUploadRequest {
