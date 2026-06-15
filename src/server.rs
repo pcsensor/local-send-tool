@@ -2,7 +2,7 @@ use crate::client::{send_file_with_options, send_text, FileSendOptions, Progress
 use crate::peer::Peer;
 use crate::peer::PeerRegistry;
 use crate::tui::TuiEvent;
-use crate::web_ui::{self, WebRuntimeInfo};
+use crate::web_ui::{self, SseMessage, WebRuntimeInfo};
 use axum::{
     body::Body,
     extract::{multipart::Field, DefaultBodyLimit, Multipart, Path as AxumPath, State},
@@ -26,6 +26,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, Notify};
+use tokio::sync::broadcast::Sender as BroadcastSender;
 use tokio_util::io::StreamReader;
 
 type UploadSessions = Arc<Mutex<HashMap<String, UploadSessionEntry>>>;
@@ -37,6 +38,7 @@ pub struct ServerState {
     upload_sessions: UploadSessions,
     event_tx: Option<UnboundedSender<TuiEvent>>,
     web_info: Option<WebRuntimeInfo>,
+    sse_tx: Option<BroadcastSender<String>>,
 }
 
 #[derive(Deserialize)]
@@ -103,15 +105,16 @@ struct InitUploadResponse {
 }
 
 pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
-    make_router_with_events(registry, download_dir, None)
+    make_router_with_events(registry, download_dir, None, None)
 }
 
 pub fn make_router_with_events(
     registry: PeerRegistry,
     download_dir: PathBuf,
     event_tx: Option<UnboundedSender<TuiEvent>>,
+    sse_tx: Option<BroadcastSender<String>>,
 ) -> Router {
-    make_router_with_events_and_info(registry, download_dir, event_tx, None)
+    make_router_with_events_and_info(registry, download_dir, event_tx, None, sse_tx)
 }
 
 pub fn make_router_with_events_and_info(
@@ -119,6 +122,7 @@ pub fn make_router_with_events_and_info(
     download_dir: PathBuf,
     event_tx: Option<UnboundedSender<TuiEvent>>,
     web_info: Option<WebRuntimeInfo>,
+    sse_tx: Option<BroadcastSender<String>>,
 ) -> Router {
     let state = ServerState {
         registry,
@@ -126,6 +130,7 @@ pub fn make_router_with_events_and_info(
         upload_sessions: Arc::new(Mutex::new(HashMap::new())),
         event_tx,
         web_info,
+        sse_tx,
     };
 
     #[cfg(target_pointer_width = "64")]
@@ -147,6 +152,8 @@ pub fn make_router_with_events_and_info(
         .route("/app", get(web_ui::index))
         .route("/api/peers", get(handle_peers))
         .route("/api/runtime", get(handle_runtime))
+        .route("/api/events", get(handle_sse_events))
+        .route("/api/config", get(handle_get_config).post(handle_save_config))
         .route(
             "/api/web/message",
             post(handle_web_message).layer(DefaultBodyLimit::max(1024 * 1024)),
@@ -192,6 +199,58 @@ async fn handle_runtime(State(state): State<ServerState>) -> impl IntoResponse {
     match state.web_info {
         Some(info) => Json(info).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn handle_sse_events(State(state): State<ServerState>) -> impl IntoResponse {
+    if let Some(sse_tx) = &state.sse_tx {
+        let rx = sse_tx.subscribe();
+        web_ui::sse_events(rx).await.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfigSavePayload {
+    defaults: Option<crate::config::ConfigDefaults>,
+}
+
+#[derive(Serialize)]
+struct ConfigResponse {
+    defaults: crate::config::ConfigDefaults,
+}
+
+async fn handle_get_config() -> impl IntoResponse {
+    let config = crate::config::AppConfig::load().unwrap_or_default();
+    Json(ConfigResponse {
+        defaults: config.defaults,
+    })
+}
+
+async fn handle_save_config(
+    payload: Result<Json<ConfigSavePayload>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let Json(payload) = match payload {
+        Ok(p) => p,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let defaults = payload.defaults.unwrap_or_default();
+    let config = crate::config::AppConfig { defaults };
+    let config_path = crate::config::config_file_path();
+    if let Some(path) = &config_path {
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message": format!("无法创建配置目录: {}", e)}))).into_response();
+            }
+        }
+        let content = toml::to_string_pretty(&config).unwrap_or_default();
+        if let Err(e) = std::fs::write(path, content) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message": format!("无法写入配置文件: {}", e)}))).into_response();
+        }
+        Json(ConfigResponse { defaults: config.defaults }).into_response()
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message": "无法确定配置文件路径"}))).into_response()
     }
 }
 
@@ -508,6 +567,13 @@ async fn handle_message(
             text: payload.text.clone(),
         });
     }
+    // Broadcast SSE event for web clients
+    if let Some(sse_tx) = &state.sse_tx {
+        let msg = SseMessage::message(payload.sender_name.clone(), payload.text.clone());
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let _ = sse_tx.send(json);
+        }
+    }
     Json(StandardResponse {
         status: "success".to_string(),
         received_bytes: None,
@@ -638,9 +704,17 @@ async fn handle_file(
     if let Some(tx) = &state.event_tx {
         let _ = tx.send(TuiEvent::FileReceived {
             sender: sender_name.clone(),
-            file_name,
+            file_name: file_name.clone(),
             file_size: received_bytes,
         });
+    }
+
+    // Broadcast SSE event for web clients
+    if let Some(sse_tx) = &state.sse_tx {
+        let msg = SseMessage::file(sender_name.clone(), file_name.clone(), received_bytes);
+        if let Ok(json) = serde_json::to_string(&msg) {
+            let _ = sse_tx.send(json);
+        }
     }
 
     Json(StandardResponse {
@@ -889,9 +963,16 @@ async fn handle_file_complete(
             if let Some(tx) = &state.event_tx {
                 let _ = tx.send(TuiEvent::FileReceived {
                     sender: session.sender_name.clone(),
-                    file_name,
+                    file_name: file_name.clone(),
                     file_size: session.file_size,
                 });
+            }
+            // Broadcast SSE event for web clients
+            if let Some(sse_tx) = &state.sse_tx {
+                let msg = SseMessage::file(session.sender_name.clone(), file_name.clone(), session.file_size);
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    let _ = sse_tx.send(json);
+                }
             }
             Json(StandardResponse {
                 status: "success".to_string(),
@@ -1768,6 +1849,7 @@ mod tests {
             upload_sessions: upload_sessions.clone(),
             event_tx: None,
             web_info: None,
+            sse_tx: None,
         };
 
         let session_dir = tmp_dir.path().join(".dummy.chunks-stale-id");
@@ -2119,6 +2201,7 @@ mod tests {
             upload_sessions: sessions.clone(),
             event_tx: None,
             web_info: None,
+            sse_tx: None,
         };
 
         let payload = InitUploadRequest {
@@ -2213,6 +2296,7 @@ mod tests {
             upload_sessions: sessions_safe.clone(),
             event_tx: None,
             web_info: None,
+            sse_tx: None,
         };
 
         let payload_safe = InitUploadRequest {

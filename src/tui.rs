@@ -495,6 +495,7 @@ pub async fn run_tui(
         app_registry.clone(),
         download_dir,
         Some(app.event_tx.clone()),
+        None,
     );
 
     // Try to bind TCP listener

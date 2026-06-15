@@ -768,12 +768,21 @@ async fn main() {
                 download_dir: settings.download_dir.display().to_string(),
                 version: env!("CARGO_PKG_VERSION"),
                 ui_stack: "Rust Axum + embedded Web UI",
+                compress: app_config.defaults.compress,
+                retry: app_config.defaults.retry,
+                chunked: app_config.defaults.chunked,
+                chunk_size: app_config.defaults.chunk_size,
+                chunk_concurrency: app_config.defaults.chunk_concurrency,
+                cancel_timeout: app_config.defaults.cancel_timeout,
+                concurrency: app_config.defaults.concurrency,
             };
+            let (sse_tx, _) = tokio::sync::broadcast::channel::<String>(64);
             let app = lan_share::server::make_router_with_events_and_info(
                 registry,
                 settings.download_dir,
                 None,
                 Some(web_info),
+                Some(sse_tx),
             );
 
             let addr = listener.local_addr().unwrap();

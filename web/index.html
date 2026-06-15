@@ -623,36 +623,11 @@
       <div class="messages" id="messages">
         <div class="day">今天</div>
         <div class="system">已加入 UDP 发现 / 组播 224.0.0.188:50001 / 已启用 SHA-256 校验</div>
-
         <article class="msg">
           <div class="mini">快</div>
           <div class="bubble">
             <span class="name">快传助手</span>
-            当前预览已切换为群聊形态：节点就是成员，消息就是文字和文件传输事件。<span class="time">09:58</span>
-          </div>
-        </article>
-
-        <article class="msg out">
-          <div class="mini">ME</div>
-          <div class="bubble">
-            <span class="name">arch</span>
-            发送文件时会以消息气泡进入队列，右侧显示群成员和运行状态。<span class="time">09:59</span>
-          </div>
-        </article>
-
-        <article class="msg">
-          <div class="mini">BOT</div>
-          <div class="bubble">
-            <span class="name">传输助手</span>
-            <div class="file-card">
-              <div class="file-icon">ZIP</div>
-              <div>
-                <span class="file-title">界面截图.zip</span>
-                <span class="file-sub">128 MB / 分片上传 / 37%</span>
-                <div class="bar"><i style="width:37%"></i></div>
-              </div>
-            </div>
-            <span class="time">10:00</span>
+            欢迎使用局域网快传，发送文件或文字会显示在消息流中。<span class="time">刚刚</span>
           </div>
         </article>
       </div>
@@ -711,27 +686,106 @@
           </div>
         </div>
         <div class="member">
+          <div class="avatar">压缩</div>
+          <div>
+            <strong>压缩策略</strong>
+            <span id="compress-mode">auto</span>
+          </div>
+        </div>
+        <div class="member">
+          <div class="avatar">分片</div>
+          <div>
+            <strong>分片上传</strong>
+            <span id="chunked-mode">关闭</span>
+          </div>
+        </div>
+        <div class="member">
           <div class="avatar">UI</div>
           <div>
             <strong id="stack-name">嵌入式网页界面</strong>
-            <span>白色群聊式预览界面</span>
+            <span id="version-info">v--</span>
           </div>
         </div>
+        <button class="icon" id="open-config" style="margin: 12px 8px 4px; width: calc(100% - 16px); background: rgba(157, 116, 30, 0.12); justify-content: center; padding: 10px;">配置设置</button>
       </section>
 
       <footer class="footer" id="clock">--:--:--</footer>
     </aside>
   </main>
 
+  <!-- Config Modal -->
+  <div id="config-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.32); z-index:10;">
+    <div style="position:absolute; right:0; top:0; bottom:0; width:340px; background:var(--sidebar); border-left:1px solid var(--line); overflow:auto;">
+      <header class="top" style="justify-content:space-between;">
+        <strong class="group-title">配置设置</strong>
+        <button class="icon" id="close-config" style="width:32px;height:32px;">✕</button>
+      </header>
+      <div style="padding:12px;">
+        <label class="member" style="display:block; padding:8px 0;">
+          <strong style="font-size:12px; color:var(--muted);">下载目录</strong>
+          <input id="cfg-download-dir" type="text" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--sidebar-2); font-size:13px;">
+        </label>
+        <label class="member" style="display:block; padding:8px 0;">
+          <strong style="font-size:12px; color:var(--muted);">端口</strong>
+          <input id="cfg-port" type="number" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--sidebar-2); font-size:13px;">
+        </label>
+        <label class="member" style="display:block; padding:8px 0;">
+          <strong style="font-size:12px; color:var(--muted);">节点名称</strong>
+          <input id="cfg-name" type="text" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--sidebar-2); font-size:13px;">
+        </label>
+        <label class="member" style="display:block; padding:8px 0;">
+          <strong style="font-size:12px; color:var(--muted);">绑定IP (留空为默认)</strong>
+          <input id="cfg-bind-ip" type="text" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--sidebar-2); font-size:13px;" placeholder="例如 192.168.1.5">
+        </label>
+        <label class="member" style="display:block; padding:8px 0;">
+          <strong style="font-size:12px; color:var(--muted);">重试次数</strong>
+          <input id="cfg-retry" type="number" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--sidebar-2); font-size:13px;">
+        </label>
+        <label class="member" style="display:block; padding:8px 0;">
+          <strong style="font-size:12px; color:var(--muted);">压缩模式</strong>
+          <select id="cfg-compress" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--sidebar-2); font-size:13px;">
+            <option value="auto">auto - 自动判断</option>
+            <option value="always">always - 总是压缩</option>
+            <option value="never">never - 从不压缩</option>
+          </select>
+        </label>
+        <label class="member" style="display:block; padding:8px 0;">
+          <strong style="font-size:12px; color:var(--muted);">分片上传</strong>
+          <select id="cfg-chunked" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--sidebar-2); font-size:13px;">
+            <option value="true">开启</option>
+            <option value="false">关闭</option>
+          </select>
+        </label>
+        <label class="member" style="display:block; padding:8px 0;">
+          <strong style="font-size:12px; color:var(--muted);">分片大小 (字节)</strong>
+          <input id="cfg-chunk-size" type="number" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--sidebar-2); font-size:13px;">
+        </label>
+        <label class="member" style="display:block; padding:8px 0;">
+          <strong style="font-size:12px; color:var(--muted);">分片并发数</strong>
+          <input id="cfg-chunk-concurrency" type="number" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--sidebar-2); font-size:13px;">
+        </label>
+        <label class="member" style="display:block; padding:8px 0;">
+          <strong style="font-size:12px; color:var(--muted);">取消超时 (秒)</strong>
+          <input id="cfg-cancel-timeout" type="number" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--sidebar-2); font-size:13px;">
+        </label>
+        <label class="member" style="display:block; padding:8px 0;">
+          <strong style="font-size:12px; color:var(--muted);">并发传输数</strong>
+          <input id="cfg-concurrency" type="number" style="width:100%; margin-top:4px; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:var(--sidebar-2); font-size:13px;">
+        </label>
+        <div style="display:flex; gap:8px; margin-top:16px;">
+          <button class="icon" id="save-config" style="flex:1; padding:10px; background:var(--blue); color:#fffaf0; font-weight:700;">保存配置</button>
+          <button class="icon" id="cancel-config" style="flex:1; padding:10px; background:rgba(157, 116, 30, 0.12);">取消</button>
+        </div>
+        <p id="config-status" style="margin-top:8px; font-size:12px; color:var(--muted); text-align:center;"></p>
+      </div>
+    </div>
+  </div>
+
   <script>
     const state = {
       peers: [],
       selected: null,
-      queue: [
-        { name: "设计预览.mp4", type: "MP4", size: "42.8 MB", progress: 82 },
-        { name: "发布说明.md", type: "MD", size: "18 KB", progress: 100 },
-        { name: "界面截图.zip", type: "ZIP", size: "128 MB", progress: 37 }
-      ]
+      queue: []
     };
 
     const $ = (id) => document.getElementById(id);
@@ -913,6 +967,14 @@
         $("download-dir").textContent = info.download_dir;
         $("bind-ip").textContent = info.bind_ip || "0.0.0.0";
         $("stack-name").textContent = "Rust Axum 嵌入式网页界面";
+        $("version-info").textContent = `v${info.version || "--"}`;
+        $("compress-mode").textContent = info.compress || "auto";
+        $("chunked-mode").textContent = info.chunked ? "开启" : "关闭";
+        // Populate config modal defaults
+        $("cfg-download-dir").value = info.download_dir || "";
+        $("cfg-port").value = info.port || 8080;
+        $("cfg-name").value = info.node_name || "";
+        $("cfg-bind-ip").value = info.bind_ip || "";
       } catch {
         $("runtime-line").textContent = location.host;
       }
@@ -927,6 +989,70 @@
         $("latency").textContent = "离线";
       }
       renderAll();
+    }
+
+    async function loadConfig() {
+      try {
+        const config = await fetch("/api/config").then((r) => r.json());
+        const d = config.defaults || {};
+        $("cfg-download-dir").value = d.download_dir || "";
+        $("cfg-port").value = d.port || 8080;
+        $("cfg-name").value = d.name || "";
+        $("cfg-bind-ip").value = d.bind_ip || "";
+        $("cfg-retry").value = d.retry || 0;
+        $("cfg-compress").value = d.compress || "auto";
+        $("cfg-chunked").value = d.chunked ? "true" : "false";
+        $("cfg-chunk-size").value = d.chunk_size || 8388608;
+        $("cfg-chunk-concurrency").value = d.chunk_concurrency || 4;
+        $("cfg-cancel-timeout").value = d.cancel_timeout || 10;
+        $("cfg-concurrency").value = d.concurrency || 3;
+      } catch {
+        // use runtime defaults if config endpoint unavailable
+      }
+    }
+
+    async function saveConfig() {
+      const config = {
+        defaults: {
+          download_dir: $("cfg-download-dir").value || null,
+          port: parseInt($("cfg-port").value) || null,
+          name: $("cfg-name").value || null,
+          bind_ip: $("cfg-bind-ip").value || null,
+          retry: parseInt($("cfg-retry").value) || null,
+          compress: $("cfg-compress").value || "auto",
+          chunked: $("cfg-chunked").value === "true",
+          chunk_size: parseInt($("cfg-chunk-size").value) || null,
+          chunk_concurrency: parseInt($("cfg-chunk-concurrency").value) || null,
+          cancel_timeout: parseInt($("cfg-cancel-timeout").value) || null,
+          concurrency: parseInt($("cfg-concurrency").value) || null,
+          progress: true,
+        }
+      };
+      // Remove null/empty values
+      for (const key of Object.keys(config.defaults)) {
+        if (config.defaults[key] === null || config.defaults[key] === "") {
+          delete config.defaults[key];
+        }
+      }
+      try {
+        const response = await fetch("/api/config", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(config)
+        });
+        if (!response.ok) {
+          const result = await response.json().catch(() => ({}));
+          $("config-status").textContent = `保存失败: ${result.message || response.statusText}`;
+          $("config-status").style.color = "var(--danger)";
+          return;
+        }
+        $("config-status").textContent = "配置已保存 (重启后生效)";
+        $("config-status").style.color = "var(--green)";
+        addSystemMessage("配置已保存到 ~/.config/lan-share/config.toml，部分设置需重启服务生效。");
+      } catch (error) {
+        $("config-status").textContent = `保存失败: ${error.message}`;
+        $("config-status").style.color = "var(--danger)";
+      }
     }
 
     function bindInteractions() {
@@ -979,6 +1105,22 @@
           addSystemMessage(`文件发送失败：${error.message}`);
         }
       });
+
+      // Config modal bindings
+      $("open-config").addEventListener("click", async () => {
+        await loadConfig();
+        $("config-modal").style.display = "block";
+        $("config-status").textContent = "";
+      });
+      $("close-config").addEventListener("click", () => {
+        $("config-modal").style.display = "none";
+      });
+      $("cancel-config").addEventListener("click", () => {
+        $("config-modal").style.display = "none";
+      });
+      $("save-config").addEventListener("click", async () => {
+        await saveConfig();
+      });
     }
 
     function formatSize(bytes) {
@@ -1003,9 +1145,66 @@
       }).format(new Date());
     }
 
+    function addReceivedMessage(sender, text) {
+      const node = document.createElement("article");
+      node.className = "msg";
+      node.innerHTML = `
+        <div class="mini">${escapeHtml(initials(sender))}</div>
+        <div class="bubble">
+          <span class="name">${escapeHtml(sender)}</span>
+          ${escapeHtml(text)}<span class="time">${shortTime()}</span>
+        </div>
+      `;
+      $("messages").appendChild(node);
+      node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    function addReceivedFileMessage(sender, fileName, fileSize) {
+      const type = fileName.split(".").pop()?.slice(0, 3).toUpperCase() || "BIN";
+      const node = document.createElement("article");
+      node.className = "msg";
+      node.innerHTML = `
+        <div class="mini">${escapeHtml(initials(sender))}</div>
+        <div class="bubble">
+          <span class="name">${escapeHtml(sender)}</span>
+          <div class="file-card">
+            <div class="file-icon">${escapeHtml(type)}</div>
+            <div>
+              <span class="file-title">${escapeHtml(fileName)}</span>
+              <span class="file-sub">${escapeHtml(formatSize(fileSize || 0))} / 已接收</span>
+              <div class="bar"><i style="width:100%"></i></div>
+            </div>
+          </div>
+          <span class="time">${shortTime()}</span>
+        </div>
+      `;
+      $("messages").appendChild(node);
+      node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    function connectSSE() {
+      const source = new EventSource("/api/events");
+      source.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === "message" && data.sender && data.text != null) {
+            addReceivedMessage(data.sender, data.text);
+          } else if (data.type === "file" && data.sender) {
+            addReceivedFileMessage(data.sender, data.file_name || "未知文件", data.file_size || 0);
+          }
+        } catch (err) {
+          // ignore malformed events
+        }
+      };
+      source.onerror = () => {
+        // EventSource will auto-reconnect
+      };
+    }
+
     bindInteractions();
     loadRuntime();
     loadPeers();
+    connectSSE();
     updateClock();
     setInterval(loadPeers, 1500);
     setInterval(updateClock, 1000);
