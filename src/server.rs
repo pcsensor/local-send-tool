@@ -1,11 +1,14 @@
+use crate::client::{send_file_with_options, send_text, FileSendOptions, ProgressMode};
+use crate::peer::Peer;
 use crate::peer::PeerRegistry;
 use crate::tui::TuiEvent;
+use crate::web_ui::{self, WebRuntimeInfo};
 use axum::{
     body::Body,
     extract::{multipart::Field, DefaultBodyLimit, Multipart, Path as AxumPath, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use futures_util::stream;
@@ -33,6 +36,7 @@ pub struct ServerState {
     pub download_dir: PathBuf,
     upload_sessions: UploadSessions,
     event_tx: Option<UnboundedSender<TuiEvent>>,
+    web_info: Option<WebRuntimeInfo>,
 }
 
 #[derive(Deserialize)]
@@ -41,11 +45,25 @@ pub struct MessagePayload {
     pub text: String,
 }
 
+#[derive(Deserialize)]
+struct WebMessagePayload {
+    target: Option<String>,
+    text: String,
+}
+
 #[derive(Serialize)]
 pub struct StandardResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub received_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct WebSendResponse {
+    status: String,
+    delivered: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
 
 #[derive(Clone)]
@@ -93,11 +111,21 @@ pub fn make_router_with_events(
     download_dir: PathBuf,
     event_tx: Option<UnboundedSender<TuiEvent>>,
 ) -> Router {
+    make_router_with_events_and_info(registry, download_dir, event_tx, None)
+}
+
+pub fn make_router_with_events_and_info(
+    registry: PeerRegistry,
+    download_dir: PathBuf,
+    event_tx: Option<UnboundedSender<TuiEvent>>,
+    web_info: Option<WebRuntimeInfo>,
+) -> Router {
     let state = ServerState {
         registry,
         download_dir,
         upload_sessions: Arc::new(Mutex::new(HashMap::new())),
         event_tx,
+        web_info,
     };
 
     #[cfg(target_pointer_width = "64")]
@@ -115,6 +143,18 @@ pub fn make_router_with_events(
     });
 
     Router::new()
+        .route("/", get(web_ui::index))
+        .route("/app", get(web_ui::index))
+        .route("/api/peers", get(handle_peers))
+        .route("/api/runtime", get(handle_runtime))
+        .route(
+            "/api/web/message",
+            post(handle_web_message).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
+        .route(
+            "/api/web/file",
+            post(handle_web_file).layer(DefaultBodyLimit::max(max_file_limit)),
+        )
         .route(
             "/api/message",
             post(handle_message).layer(DefaultBodyLimit::max(1024 * 1024)),
@@ -142,6 +182,17 @@ pub fn make_router_with_events(
             delete(handle_file_cancel).layer(DefaultBodyLimit::max(1024 * 1024)),
         )
         .with_state(state)
+}
+
+async fn handle_peers(State(state): State<ServerState>) -> Json<Vec<crate::peer::Peer>> {
+    Json(state.registry.list())
+}
+
+async fn handle_runtime(State(state): State<ServerState>) -> impl IntoResponse {
+    match state.web_info {
+        Some(info) => Json(info).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 struct StaleUploadCleanup {
@@ -233,6 +284,210 @@ async fn remove_upload_session_files(session: UploadSession) {
             }
         }
     }
+}
+
+async fn handle_web_message(
+    State(state): State<ServerState>,
+    payload: Result<Json<WebMessagePayload>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(_) => return web_send_error(StatusCode::BAD_REQUEST, "消息格式无效"),
+    };
+    let text = payload.text.trim();
+    if text.is_empty() {
+        return web_send_error(StatusCode::BAD_REQUEST, "消息内容不能为空");
+    }
+
+    let targets = match resolve_web_targets(&state, payload.target.as_deref()) {
+        Ok(targets) => targets,
+        Err(message) => return web_send_error(StatusCode::NOT_FOUND, message),
+    };
+    let sender = web_sender_name(&state);
+    let mut delivered = 0usize;
+    let mut last_error = None;
+
+    for peer in targets {
+        let Some(addr) = peer_address(&peer) else {
+            last_error = Some(format!("节点 '{}' 没有可用地址", peer.name));
+            continue;
+        };
+        match send_text(&addr, &sender, text).await {
+            Ok(()) => delivered += 1,
+            Err(err) => last_error = Some(format!("发送到 '{}' 失败: {}", peer.name, err)),
+        }
+    }
+
+    if delivered == 0 {
+        return web_send_error(
+            StatusCode::BAD_GATEWAY,
+            last_error.as_deref().unwrap_or("没有节点接收成功"),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(WebSendResponse {
+            status: "success".to_string(),
+            delivered,
+            message: last_error,
+        }),
+    )
+        .into_response()
+}
+
+async fn handle_web_file(
+    State(state): State<ServerState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mut target = None;
+    let mut saved_file = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => return web_send_error(StatusCode::BAD_REQUEST, "文件上传格式无效"),
+        };
+        match field.name() {
+            Some("target") => {
+                if let Ok(value) = field.text().await {
+                    let value = value.trim().to_string();
+                    if !value.is_empty() {
+                        target = Some(value);
+                    }
+                }
+            }
+            Some("file") => match save_web_file_field(field).await {
+                Ok(path) => saved_file = Some(path),
+                Err(message) => return web_send_error(StatusCode::BAD_REQUEST, &message),
+            },
+            _ => {}
+        }
+    }
+
+    let Some(file_path) = saved_file else {
+        return web_send_error(StatusCode::BAD_REQUEST, "缺少要发送的文件");
+    };
+
+    let targets = match resolve_web_targets(&state, target.as_deref()) {
+        Ok(targets) => targets,
+        Err(message) => {
+            let _ = tokio::fs::remove_file(&file_path).await;
+            return web_send_error(StatusCode::NOT_FOUND, message);
+        }
+    };
+    let sender = web_sender_name(&state);
+    let options = FileSendOptions {
+        progress: ProgressMode::None,
+        ..FileSendOptions::default()
+    };
+    let mut delivered = 0usize;
+    let mut last_error = None;
+
+    for peer in targets {
+        let Some(addr) = peer_address(&peer) else {
+            last_error = Some(format!("节点 '{}' 没有可用地址", peer.name));
+            continue;
+        };
+        match send_file_with_options(&addr, &sender, &file_path, options.clone()).await {
+            Ok(()) => delivered += 1,
+            Err(err) => last_error = Some(format!("发送到 '{}' 失败: {}", peer.name, err)),
+        }
+    }
+
+    let _ = tokio::fs::remove_file(&file_path).await;
+
+    if delivered == 0 {
+        return web_send_error(
+            StatusCode::BAD_GATEWAY,
+            last_error.as_deref().unwrap_or("没有节点接收成功"),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(WebSendResponse {
+            status: "success".to_string(),
+            delivered,
+            message: last_error,
+        }),
+    )
+        .into_response()
+}
+
+async fn save_web_file_field(mut field: Field<'_>) -> Result<PathBuf, String> {
+    let file_name = field
+        .file_name()
+        .and_then(|name| Path::new(name).file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "文件名无效".to_string())?
+        .to_string();
+    let temp_path = std::env::temp_dir().join(format!(
+        "lan-share-web-{}-{}",
+        uuid::Uuid::new_v4(),
+        file_name
+    ));
+    let mut file = tokio::fs::File::create(&temp_path)
+        .await
+        .map_err(|err| format!("无法创建临时文件: {}", err))?;
+
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|err| format!("读取上传文件失败: {}", err))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|err| format!("写入临时文件失败: {}", err))?;
+    }
+
+    Ok(temp_path)
+}
+
+fn resolve_web_targets(
+    state: &ServerState,
+    target: Option<&str>,
+) -> Result<Vec<Peer>, &'static str> {
+    if let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) {
+        return state
+            .registry
+            .find_by_name_or_ip(target)
+            .map(|peer| vec![peer])
+            .ok_or("未找到指定节点");
+    }
+
+    let peers = state.registry.list();
+    if peers.is_empty() {
+        Err("当前没有可发送的在线节点")
+    } else {
+        Ok(peers)
+    }
+}
+
+fn web_sender_name(state: &ServerState) -> String {
+    state
+        .web_info
+        .as_ref()
+        .map(|info| info.node_name.clone())
+        .unwrap_or_else(|| "Web".to_string())
+}
+
+fn peer_address(peer: &Peer) -> Option<String> {
+    peer.ips.first().map(|ip| format!("{}:{}", ip, peer.port))
+}
+
+fn web_send_error(status: StatusCode, message: &str) -> axum::response::Response {
+    (
+        status,
+        Json(WebSendResponse {
+            status: "error".to_string(),
+            delivered: 0,
+            message: Some(message.to_string()),
+        }),
+    )
+        .into_response()
 }
 
 async fn handle_message(
@@ -1512,6 +1767,7 @@ mod tests {
             download_dir: tmp_dir.path().to_path_buf(),
             upload_sessions: upload_sessions.clone(),
             event_tx: None,
+            web_info: None,
         };
 
         let session_dir = tmp_dir.path().join(".dummy.chunks-stale-id");
@@ -1862,6 +2118,7 @@ mod tests {
             download_dir: download_dir.clone(),
             upload_sessions: sessions.clone(),
             event_tx: None,
+            web_info: None,
         };
 
         let payload = InitUploadRequest {
@@ -1955,6 +2212,7 @@ mod tests {
             download_dir: download_dir.clone(),
             upload_sessions: sessions_safe.clone(),
             event_tx: None,
+            web_info: None,
         };
 
         let payload_safe = InitUploadRequest {

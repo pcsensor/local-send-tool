@@ -35,9 +35,9 @@ fn create_multicast_socket(bind_ip: Option<Ipv4Addr>) -> std::io::Result<StdUdpS
     #[cfg(not(windows))]
     socket.set_reuse_port(true)?;
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     let bind_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, MULTICAST_PORT));
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let bind_addr = SocketAddr::from((MULTICAST_ADDR, MULTICAST_PORT));
 
     socket.bind(&bind_addr.into())?;

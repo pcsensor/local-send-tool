@@ -166,6 +166,24 @@ enum Commands {
         #[arg(long, value_name = "IP")]
         bind_ip: Option<String>,
     },
+    /// Launch the next-generation Web UI preview
+    Web {
+        /// Download directory for incoming files
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Port to bind the HTTP server. If occupied, auto-increment to find a free port.
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Peer name (alias) for this node
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// 指定局域网网卡 IP（开启 TUN 代理时使用，例如 192.168.1.5）
+        #[arg(long, value_name = "IP")]
+        bind_ip: Option<String>,
+    },
 }
 
 async fn find_available_port(
@@ -185,7 +203,7 @@ async fn find_available_port(
                 return (listener, port);
             }
             Err(e) => {
-                if start_port == 0 {
+                if start_port == 0 || e.kind() != std::io::ErrorKind::AddrInUse {
                     panic!("Failed to bind to auto-allocated port: {}", e);
                 }
                 println!(
@@ -649,6 +667,123 @@ async fn main() {
             if let Err(e) = lan_share::tui::run_tui(app_config, bind_ip, actual_port).await {
                 eprintln!("TUI error: {}", e);
                 std::process::exit(1);
+            }
+        }
+        Commands::Web {
+            dir,
+            port,
+            name,
+            bind_ip,
+        } => {
+            let home_dir = required_home_dir();
+            let explicit_bind_ip = bind_ip.is_some();
+            let settings = lan_share::config::resolve_serve_settings(
+                &home_dir,
+                lan_share::config::ConfigOverrides {
+                    download_dir: dir,
+                    port,
+                    name,
+                    bind_ip,
+                    ..lan_share::config::ConfigOverrides::default()
+                },
+                &env_config,
+                &app_config,
+            );
+            let configured_bind_ip = settings.bind_ip.clone();
+            let mut bind_ip = parse_bind_ip(configured_bind_ip.as_deref());
+            let (listener, actual_port) = match lan_share::find_available_port(
+                bind_ip,
+                settings.port,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(e)
+                    if !explicit_bind_ip
+                        && bind_ip.is_some()
+                        && e.kind() == std::io::ErrorKind::AddrNotAvailable =>
+                {
+                    eprintln!(
+                            "配置中的 bind_ip={} 不属于当前网卡，Web 模式已自动回退到默认绑定。需要固定网卡时请使用 --bind-ip 指定本机实际局域网 IP。",
+                            configured_bind_ip.as_deref().unwrap_or("")
+                        );
+                    bind_ip = None;
+                    lan_share::find_available_port(None, settings.port)
+                        .await
+                        .unwrap_or_else(|err| {
+                            eprintln!("Web 服务绑定失败: {}", err);
+                            std::process::exit(1);
+                        })
+                }
+                Err(e) => {
+                    eprintln!("Web 服务绑定失败: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let node_name = settings.name.unwrap_or_else(|| {
+                hostname::get()
+                    .ok()
+                    .and_then(|h| h.into_string().ok())
+                    .unwrap_or_else(|| "Unknown-Node".to_string())
+            });
+
+            let registry = lan_share::peer::PeerRegistry::new();
+
+            let listener_registry = registry.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    lan_share::discovery::start_listener(listener_registry, bind_ip).await
+                {
+                    eprintln!("Listener background task failed: {}", e);
+                }
+            });
+
+            let clean_registry = registry.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                    clean_registry.clean_stale(std::time::Duration::from_secs(9));
+                }
+            });
+
+            let peer = lan_share::peer::Peer {
+                uuid: uuid::Uuid::new_v4().to_string(),
+                name: node_name.clone(),
+                port: actual_port,
+                ips: lan_share::discovery::get_local_ips(bind_ip),
+            };
+            let broadcaster_peer = peer.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    lan_share::discovery::start_broadcaster(broadcaster_peer, bind_ip).await
+                {
+                    eprintln!("Broadcaster background task failed: {}", e);
+                }
+            });
+
+            let web_info = lan_share::web_ui::WebRuntimeInfo {
+                node_name: node_name.clone(),
+                port: actual_port,
+                bind_ip: bind_ip.map(|ip| ip.to_string()),
+                download_dir: settings.download_dir.display().to_string(),
+                version: env!("CARGO_PKG_VERSION"),
+                ui_stack: "Rust Axum + embedded Web UI",
+            };
+            let app = lan_share::server::make_router_with_events_and_info(
+                registry,
+                settings.download_dir,
+                None,
+                Some(web_info),
+            );
+
+            let addr = listener.local_addr().unwrap();
+            println!("Web UI stack: Rust Axum + embedded HTML/CSS/JS");
+            println!("节点名称: {}", node_name);
+            println!("Server UUID: {}", peer.uuid);
+            println!("Web 界面: http://{}", addr);
+
+            if let Err(e) = axum::serve(listener, app).await {
+                eprintln!("Web UI server exited with error: {}", e);
             }
         }
     }

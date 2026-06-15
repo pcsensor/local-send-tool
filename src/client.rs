@@ -758,7 +758,7 @@ mod tests {
     use crate::peer::PeerRegistry;
     use crate::server::make_router;
     use axum::{
-        extract::Path as AxumPath,
+        extract::{Multipart, Path as AxumPath},
         http::StatusCode,
         routing::{delete, post, put},
         Json, Router,
@@ -863,12 +863,15 @@ mod tests {
             "/api/file",
             post({
                 let attempts = Arc::clone(&attempts);
-                move || {
+                move |mut multipart: Multipart| {
                     let attempts = Arc::clone(&attempts);
                     async move {
                         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                             StatusCode::INTERNAL_SERVER_ERROR
                         } else {
+                            while let Ok(Some(field)) = multipart.next_field().await {
+                                let _ = field.bytes().await;
+                            }
                             StatusCode::OK
                         }
                     }

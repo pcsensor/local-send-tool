@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod peer;
 pub mod server;
 pub mod tui;
+pub mod web_ui;
 
 /// Find an available TCP port starting from `start_port`.
 /// Returns the bound listener and the actual port number.
@@ -24,7 +25,7 @@ pub async fn find_available_port(
                 return Ok((listener, port));
             }
             Err(e) => {
-                if start_port == 0 {
+                if start_port == 0 || e.kind() != std::io::ErrorKind::AddrInUse {
                     return Err(e);
                 }
                 if actual_port == u16::MAX {

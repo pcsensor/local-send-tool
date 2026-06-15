@@ -1,0 +1,1014 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>局域网传输群</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --app: #f7f4ee;
+      --sidebar: #fffdf8;
+      --sidebar-2: #f0eadf;
+      --chat: #fbf7ef;
+      --header: rgba(255, 253, 248, 0.94);
+      --bubble-in: #ffffff;
+      --bubble-out: #f2dfad;
+      --bubble-file: #fff8e6;
+      --line: rgba(109, 81, 31, 0.14);
+      --line-strong: rgba(109, 81, 31, 0.25);
+      --text: #2c2419;
+      --muted: #8a7b66;
+      --blue: #9d741e;
+      --green: #806019;
+      --amber: #b78a27;
+      --danger: #b45d43;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      overflow: hidden;
+      color: var(--text);
+      background:
+        radial-gradient(ellipse at top left, rgba(183, 138, 39, 0.16), transparent 38%),
+        linear-gradient(135deg, #fffefa 0%, #f4efe5 48%, #fbf8f1 100%);
+    }
+
+    body::before {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      content: "";
+      opacity: 0.28;
+      background:
+        repeating-linear-gradient(45deg, transparent 0 18px, rgba(157, 116, 30, 0.06) 19px, transparent 20px 42px),
+        radial-gradient(circle at 24px 24px, rgba(157, 116, 30, 0.08) 1px, transparent 2px);
+      background-size: 84px 84px, 48px 48px;
+      mix-blend-mode: screen;
+    }
+
+    button,
+    input {
+      font: inherit;
+    }
+
+    button {
+      border: 0;
+      color: inherit;
+      cursor: pointer;
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: 330px minmax(480px, 1fr) 310px;
+      height: 100vh;
+      position: relative;
+      z-index: 1;
+    }
+
+    .chats {
+      min-width: 0;
+      border-right: 1px solid var(--line);
+      background: var(--sidebar);
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+    }
+
+    .top {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      height: 56px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .round {
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 999px;
+      background: rgba(183, 138, 39, 0.16);
+      color: var(--blue);
+      font-weight: 800;
+    }
+
+    .search {
+      padding: 10px 12px;
+    }
+
+    .search input,
+    .composer input {
+      width: 100%;
+      min-width: 0;
+      outline: none;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      background: var(--sidebar-2);
+      color: var(--text);
+      padding: 10px 14px;
+      font-size: 13px;
+    }
+
+    .search input:focus,
+    .composer input:focus {
+      border-color: rgba(157, 116, 30, 0.45);
+    }
+
+    .chat-list {
+      min-height: 0;
+      overflow: auto;
+      padding: 0 8px 10px;
+    }
+
+    .chat-row {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 46px 1fr auto;
+      gap: 10px;
+      align-items: center;
+      padding: 9px 10px;
+      border-radius: 10px;
+      background: transparent;
+      text-align: left;
+      transition: 140ms ease;
+    }
+
+    .chat-row:hover,
+    .chat-row.active {
+      background: rgba(157, 116, 30, 0.11);
+    }
+
+    .avatar {
+      display: grid;
+      place-items: center;
+      width: 46px;
+      height: 46px;
+      border-radius: 50%;
+      background:
+        linear-gradient(145deg, #f0d181, #a77a20),
+        radial-gradient(circle at 30% 20%, rgba(255, 255, 255, 0.42), transparent 44%);
+      font-weight: 820;
+      color: #34240b;
+    }
+
+    .chat-main,
+    .chat-meta,
+    .bubble strong,
+    .chat-row strong {
+      min-width: 0;
+    }
+
+    .chat-row strong,
+    .chat-row span,
+    .meta-line,
+    .member strong,
+    .member span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .chat-row strong {
+      display: block;
+      font-size: 13px;
+      font-weight: 720;
+    }
+
+    .chat-row span,
+    .chat-time {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .badge {
+      min-width: 20px;
+      height: 20px;
+      border-radius: 999px;
+      padding: 0 6px;
+      background: var(--blue);
+      color: white;
+      font-size: 11px;
+      display: grid;
+      place-items: center;
+      margin-top: 5px;
+    }
+
+    .chat {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: 56px 1fr auto;
+      background:
+        linear-gradient(135deg, rgba(157, 116, 30, 0.045) 25%, transparent 25%) 0 0 / 30px 30px,
+        linear-gradient(225deg, rgba(157, 116, 30, 0.035) 25%, transparent 25%) 0 0 / 30px 30px,
+        radial-gradient(circle at 20px 20px, rgba(157, 116, 30, 0.06) 1px, transparent 1px),
+        var(--chat);
+    }
+
+    .chat-header {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 14px;
+      align-items: center;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--line);
+      background: var(--header);
+    }
+
+    .group-title {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 760;
+    }
+
+    .group-subtitle {
+      margin: 3px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .header-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .icon {
+      display: grid;
+      place-items: center;
+      min-width: 42px;
+      height: 34px;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--muted);
+      transition: 140ms ease;
+      font-size: 11px;
+      font-weight: 760;
+      letter-spacing: 0;
+    }
+
+    .icon:hover {
+      background: rgba(157, 116, 30, 0.11);
+      color: var(--text);
+    }
+
+    .messages {
+      min-height: 0;
+      overflow: auto;
+      padding: 18px 22px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .day {
+      align-self: center;
+      border-radius: 999px;
+      background: rgba(255, 253, 248, 0.82);
+      color: #7e6c51;
+      padding: 5px 12px;
+      font-size: 12px;
+      backdrop-filter: blur(8px);
+    }
+
+    .msg {
+      display: flex;
+      gap: 8px;
+      align-items: flex-end;
+      max-width: min(680px, 86%);
+    }
+
+    .msg.out {
+      align-self: flex-end;
+      flex-direction: row-reverse;
+    }
+
+    .mini {
+      display: grid;
+      place-items: center;
+      flex: 0 0 auto;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: #d9c081;
+      color: #4a3510;
+      font-size: 11px;
+      font-weight: 760;
+    }
+
+    .bubble {
+      min-width: 0;
+      border-radius: 12px;
+      padding: 9px 11px;
+      background: var(--bubble-in);
+      box-shadow: 0 3px 14px rgba(84, 60, 18, 0.12);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .out .bubble {
+      background: var(--bubble-out);
+    }
+
+    .name {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 760;
+    }
+
+    .out .name {
+      color: #5f4715;
+    }
+
+    .time {
+      margin-left: 8px;
+      color: rgba(74, 54, 20, 0.58);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .file-card {
+      display: grid;
+      grid-template-columns: 42px 1fr;
+      gap: 10px;
+      align-items: center;
+      min-width: 260px;
+      margin-top: 2px;
+      border-radius: 10px;
+      background:
+        linear-gradient(135deg, rgba(183, 138, 39, 0.10), transparent),
+        rgba(255, 255, 255, 0.58);
+      padding: 10px;
+    }
+
+    .file-icon {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      background: rgba(183, 138, 39, 0.18);
+      color: var(--blue);
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .file-title {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 13px;
+      font-weight: 720;
+    }
+
+    .file-sub {
+      color: rgba(74, 54, 20, 0.62);
+      font-size: 12px;
+    }
+
+    .bar {
+      height: 4px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(109, 81, 31, 0.14);
+      margin-top: 7px;
+    }
+
+    .bar i {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #77551c, #d6a034, #f1c86a);
+      transition: width 240ms ease;
+    }
+
+    .system {
+      align-self: center;
+      border-radius: 10px;
+      border: 1px solid rgba(157, 116, 30, 0.20);
+      background: rgba(255, 253, 248, 0.88);
+      padding: 8px 12px;
+      color: #7a6a52;
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+
+    .composer {
+      display: grid;
+      grid-template-columns: auto 1fr auto auto;
+      gap: 8px;
+      align-items: center;
+      padding: 10px 16px 14px;
+      background: linear-gradient(180deg, transparent, rgba(251, 247, 239, 0.96) 18%);
+    }
+
+    .send {
+      display: grid;
+      place-items: center;
+      width: 58px;
+      height: 38px;
+      border-radius: 999px;
+      background: var(--blue);
+      color: #fffaf0;
+      font-size: 11px;
+      font-weight: 900;
+    }
+
+    .info {
+      min-width: 0;
+      border-left: 1px solid var(--line);
+      background: #fffdf8;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+    }
+
+    .info-cover {
+      padding: 18px 16px 14px;
+      border-bottom: 1px solid var(--line);
+      background:
+        repeating-linear-gradient(135deg, rgba(157, 116, 30, 0.08) 0 1px, transparent 1px 12px),
+        linear-gradient(135deg, rgba(255, 247, 225, 0.92), rgba(242, 226, 188, 0.72));
+    }
+
+    .group-avatar {
+      display: grid;
+      place-items: center;
+      width: 72px;
+      height: 72px;
+      border-radius: 50%;
+      margin-bottom: 12px;
+      background: linear-gradient(145deg, #f0d181, #a77a20);
+      color: #34240b;
+      font-weight: 900;
+      font-size: 22px;
+    }
+
+    .info h2 {
+      margin: 0;
+      font-size: 15px;
+    }
+
+    .info p {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .stat {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background:
+        linear-gradient(135deg, rgba(183, 138, 39, 0.075), transparent),
+        rgba(255, 255, 255, 0.64);
+    }
+
+    .stat span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .stat strong {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      margin-top: 4px;
+      font-size: 13px;
+      font-family: var(--mono);
+    }
+
+    .members {
+      min-height: 0;
+      overflow: auto;
+      padding: 8px;
+    }
+
+    .section-title {
+      margin: 10px 8px 8px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 760;
+      text-transform: uppercase;
+    }
+
+    .member {
+      display: grid;
+      grid-template-columns: 38px 1fr;
+      gap: 9px;
+      align-items: center;
+      padding: 8px;
+      border-radius: 10px;
+    }
+
+    .member:hover {
+      background: rgba(157, 116, 30, 0.08);
+    }
+
+    .member .avatar {
+      width: 38px;
+      height: 38px;
+      font-size: 12px;
+    }
+
+    .member strong {
+      display: block;
+      font-size: 13px;
+    }
+
+    .member span,
+    .meta-line {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .footer {
+      padding: 11px 14px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+
+    .empty {
+      color: var(--muted);
+      padding: 12px;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    @media (max-width: 1120px) {
+      .app {
+        grid-template-columns: 300px 1fr;
+      }
+
+      .info {
+        display: none;
+      }
+    }
+
+    @media (max-width: 760px) {
+      body {
+        overflow: auto;
+      }
+
+      .app {
+        grid-template-columns: 1fr;
+        height: auto;
+        min-height: 100vh;
+      }
+
+      .chats {
+        min-height: 360px;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .chat {
+        min-height: 620px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <aside class="chats" aria-label="会话列表">
+      <header class="top">
+        <div class="round">快</div>
+        <div>
+          <strong class="group-title">局域网快传</strong>
+          <p class="group-subtitle" id="runtime-line">群聊式传输控制台</p>
+        </div>
+      </header>
+      <div class="search">
+        <input id="filter" type="search" placeholder="搜索群聊、节点、地址">
+      </div>
+      <div class="chat-list" id="chat-list"></div>
+    </aside>
+
+    <section class="chat" aria-label="群聊传输">
+      <header class="chat-header">
+        <div>
+          <h1 class="group-title" id="selected-name">局域网传输群</h1>
+          <p class="group-subtitle" id="peer-count">正在扫描局域网</p>
+        </div>
+        <div class="header-actions">
+          <button class="icon" title="刷新节点" id="refresh">刷新</button>
+          <button class="icon" title="复制预览地址" id="copy-url">复制</button>
+          <button class="icon" title="群信息">详情</button>
+        </div>
+      </header>
+
+      <div class="messages" id="messages">
+        <div class="day">今天</div>
+        <div class="system">已加入 UDP 发现 / 组播 224.0.0.188:50001 / 已启用 SHA-256 校验</div>
+
+        <article class="msg">
+          <div class="mini">快</div>
+          <div class="bubble">
+            <span class="name">快传助手</span>
+            当前预览已切换为群聊形态：节点就是成员，消息就是文字和文件传输事件。<span class="time">09:58</span>
+          </div>
+        </article>
+
+        <article class="msg out">
+          <div class="mini">ME</div>
+          <div class="bubble">
+            <span class="name">arch</span>
+            发送文件时会以消息气泡进入队列，右侧显示群成员和运行状态。<span class="time">09:59</span>
+          </div>
+        </article>
+
+        <article class="msg">
+          <div class="mini">BOT</div>
+          <div class="bubble">
+            <span class="name">传输助手</span>
+            <div class="file-card">
+              <div class="file-icon">ZIP</div>
+              <div>
+                <span class="file-title">界面截图.zip</span>
+                <span class="file-sub">128 MB / 分片上传 / 37%</span>
+                <div class="bar"><i style="width:37%"></i></div>
+              </div>
+            </div>
+            <span class="time">10:00</span>
+          </div>
+        </article>
+      </div>
+
+      <footer class="composer">
+        <button class="icon" title="添加文件" id="attach">文件</button>
+        <input id="file-input" type="file" hidden>
+        <input id="message" placeholder="在局域网传输群中输入消息">
+        <button class="icon" title="压缩策略">压缩</button>
+        <button class="send" id="send" title="发送">发送</button>
+      </footer>
+    </section>
+
+    <aside class="info" aria-label="群信息">
+      <section class="info-cover">
+        <div class="group-avatar">快</div>
+        <h2>局域网传输群</h2>
+        <p>局域网节点群聊 / 文件和文本统一为消息流</p>
+      </section>
+
+      <section class="stats">
+        <div class="stat">
+          <span>本机节点</span>
+          <strong id="metric-node">--</strong>
+        </div>
+        <div class="stat">
+          <span>监听端口</span>
+          <strong id="metric-port">--</strong>
+        </div>
+        <div class="stat">
+          <span>在线节点</span>
+          <strong id="metric-peers">0</strong>
+        </div>
+        <div class="stat">
+          <span>延迟</span>
+          <strong id="latency">--</strong>
+        </div>
+      </section>
+
+      <section class="members">
+        <h3 class="section-title">在线成员</h3>
+        <div id="member-list"></div>
+        <h3 class="section-title">运行信息</h3>
+        <div class="member">
+          <div class="avatar">FS</div>
+          <div>
+            <strong>保存目录</strong>
+            <span id="download-dir">--</span>
+          </div>
+        </div>
+        <div class="member">
+          <div class="avatar">IP</div>
+          <div>
+            <strong>绑定地址</strong>
+            <span id="bind-ip">0.0.0.0</span>
+          </div>
+        </div>
+        <div class="member">
+          <div class="avatar">UI</div>
+          <div>
+            <strong id="stack-name">嵌入式网页界面</strong>
+            <span>白色群聊式预览界面</span>
+          </div>
+        </div>
+      </section>
+
+      <footer class="footer" id="clock">--:--:--</footer>
+    </aside>
+  </main>
+
+  <script>
+    const state = {
+      peers: [],
+      selected: null,
+      queue: [
+        { name: "设计预览.mp4", type: "MP4", size: "42.8 MB", progress: 82 },
+        { name: "发布说明.md", type: "MD", size: "18 KB", progress: 100 },
+        { name: "界面截图.zip", type: "ZIP", size: "128 MB", progress: 37 }
+      ]
+    };
+
+    const $ = (id) => document.getElementById(id);
+
+    function initials(name) {
+      return (name || "快传").slice(0, 2).toUpperCase();
+    }
+
+    function bestAddress(peer) {
+      const ip = peer.ips && peer.ips.length ? peer.ips[0] : "未知地址";
+      return `${ip}:${peer.port}`;
+    }
+
+    function renderChats() {
+      const query = $("filter").value.trim().toLowerCase();
+      const chats = [
+        {
+          id: "group",
+          title: "局域网传输群",
+          preview: `${state.peers.length} 个节点在线 / 本地文件总线`,
+          active: !state.selected,
+          badge: state.peers.length,
+          initials: "快"
+        },
+        ...state.peers.map((peer) => ({
+          id: peer.uuid,
+          title: peer.name,
+          preview: bestAddress(peer),
+          active: state.selected && state.selected.uuid === peer.uuid,
+          badge: 0,
+          initials: initials(peer.name)
+        }))
+      ].filter((chat) => `${chat.title} ${chat.preview}`.toLowerCase().includes(query));
+
+      $("chat-list").innerHTML = chats.map((chat) => `
+        <button class="chat-row${chat.active ? " active" : ""}" data-peer="${chat.id}">
+          <div class="avatar">${escapeHtml(chat.initials)}</div>
+          <div class="chat-main">
+            <strong>${escapeHtml(chat.title)}</strong>
+            <span>${escapeHtml(chat.preview)}</span>
+          </div>
+          <div class="chat-meta">
+            <span class="chat-time">刚刚</span>
+            ${chat.badge ? `<div class="badge">${chat.badge}</div>` : ""}
+          </div>
+        </button>
+      `).join("");
+
+      $("chat-list").querySelectorAll("[data-peer]").forEach((button) => {
+        button.addEventListener("click", () => {
+          state.selected = state.peers.find((peer) => peer.uuid === button.dataset.peer) || null;
+          renderAll();
+        });
+      });
+    }
+
+    function renderMembers() {
+      const members = state.peers.length ? state.peers : [];
+      $("member-list").innerHTML = members.length ? members.map((peer) => `
+        <div class="member">
+          <div class="avatar">${escapeHtml(initials(peer.name))}</div>
+          <div>
+            <strong>${escapeHtml(peer.name)}</strong>
+            <span>${escapeHtml(bestAddress(peer))}</span>
+          </div>
+        </div>
+      `).join("") : `<div class="empty">暂无远端成员，启动另一台 lan-share 节点后会加入群聊。</div>`;
+    }
+
+    function renderHeader() {
+      $("peer-count").textContent = `${state.peers.length} 个节点在线 / UDP 自动发现`;
+      $("metric-peers").textContent = String(state.peers.length);
+      $("selected-name").textContent = state.selected ? state.selected.name : "局域网传输群";
+    }
+
+    function renderAll() {
+      renderChats();
+      renderMembers();
+      renderHeader();
+    }
+
+    function queueBubble(item) {
+      return `
+        <article class="msg">
+          <div class="mini">BOT</div>
+          <div class="bubble">
+            <span class="name">传输助手</span>
+            <div class="file-card">
+              <div class="file-icon">${escapeHtml(item.type)}</div>
+              <div>
+                <span class="file-title">${escapeHtml(item.name)}</span>
+                <span class="file-sub">${escapeHtml(item.size)} / ${item.progress >= 100 ? "已完成" : "上传中"} / ${Math.round(item.progress)}%</span>
+                <div class="bar"><i style="width:${item.progress}%"></i></div>
+              </div>
+            </div>
+            <span class="time">${shortTime()}</span>
+          </div>
+        </article>
+      `;
+    }
+
+    function addMessage(text) {
+      const node = document.createElement("article");
+      node.className = "msg out";
+      node.innerHTML = `
+        <div class="mini">ME</div>
+        <div class="bubble">
+          <span class="name">arch</span>
+          ${escapeHtml(text)}<span class="time">${shortTime()}</span>
+        </div>
+      `;
+      $("messages").appendChild(node);
+      node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    function addSystemMessage(text) {
+      const node = document.createElement("div");
+      node.className = "system";
+      node.textContent = text;
+      $("messages").appendChild(node);
+      node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    function addFileMessage(file) {
+      const type = file.name.split(".").pop()?.slice(0, 3).toUpperCase() || "BIN";
+      const item = { name: file.name, type, size: formatSize(file.size), progress: 3 };
+      state.queue.unshift(item);
+      $("messages").insertAdjacentHTML("beforeend", queueBubble(item));
+      $("messages").lastElementChild.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    function selectedTarget() {
+      return state.selected ? state.selected.uuid : "";
+    }
+
+    async function sendTextMessage(text) {
+      const response = await fetch("/api/web/message", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ target: selectedTarget(), text })
+      });
+      const result = await response.json().catch(() => ({ message: "发送失败" }));
+      if (!response.ok) {
+        throw new Error(result.message || "发送失败");
+      }
+      return result;
+    }
+
+    async function sendFile(file) {
+      const form = new FormData();
+      form.append("target", selectedTarget());
+      form.append("file", file);
+      const response = await fetch("/api/web/file", {
+        method: "POST",
+        body: form
+      });
+      const result = await response.json().catch(() => ({ message: "文件发送失败" }));
+      if (!response.ok) {
+        throw new Error(result.message || "文件发送失败");
+      }
+      return result;
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    async function loadRuntime() {
+      try {
+        const info = await fetch("/api/runtime").then((response) => response.json());
+        $("runtime-line").textContent = `${info.node_name} / ${location.host}`;
+        $("metric-node").textContent = info.node_name;
+        $("metric-port").textContent = String(info.port);
+        $("download-dir").textContent = info.download_dir;
+        $("bind-ip").textContent = info.bind_ip || "0.0.0.0";
+        $("stack-name").textContent = "Rust Axum 嵌入式网页界面";
+      } catch {
+        $("runtime-line").textContent = location.host;
+      }
+    }
+
+    async function loadPeers() {
+      const started = performance.now();
+      try {
+        state.peers = await fetch("/api/peers").then((response) => response.json());
+        $("latency").textContent = `${Math.max(1, Math.round(performance.now() - started))}ms`;
+      } catch {
+        $("latency").textContent = "离线";
+      }
+      renderAll();
+    }
+
+    function bindInteractions() {
+      $("filter").addEventListener("input", renderChats);
+      $("refresh").addEventListener("click", loadPeers);
+      $("copy-url").addEventListener("click", async () => {
+        await navigator.clipboard.writeText(location.href);
+        addMessage("已复制群聊预览地址。");
+      });
+      $("send").addEventListener("click", async () => {
+        const input = $("message");
+        if (!input.value.trim()) return;
+        const text = input.value.trim();
+        addMessage(text);
+        input.value = "";
+        try {
+          const result = await sendTextMessage(text);
+          addSystemMessage(`消息已送达 ${result.delivered} 个节点。`);
+        } catch (error) {
+          addSystemMessage(`消息发送失败：${error.message}`);
+        }
+      });
+      $("message").addEventListener("keydown", (event) => {
+        if (event.key === "Enter") $("send").click();
+      });
+      $("attach").addEventListener("click", () => $("file-input").click());
+      $("file-input").addEventListener("change", async (event) => {
+        const file = event.target.files[0];
+        event.target.value = "";
+        if (!file) return;
+        addFileMessage(file);
+        try {
+          const result = await sendFile(file);
+          addSystemMessage(`文件已送达 ${result.delivered} 个节点。`);
+        } catch (error) {
+          addSystemMessage(`文件发送失败：${error.message}`);
+        }
+      });
+
+      document.addEventListener("dragover", (event) => event.preventDefault());
+      document.addEventListener("drop", async (event) => {
+        event.preventDefault();
+        const file = event.dataTransfer.files[0];
+        if (!file) return;
+        addFileMessage(file);
+        try {
+          const result = await sendFile(file);
+          addSystemMessage(`文件已送达 ${result.delivered} 个节点。`);
+        } catch (error) {
+          addSystemMessage(`文件发送失败：${error.message}`);
+        }
+      });
+    }
+
+    function formatSize(bytes) {
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+      return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+    }
+
+    function shortTime() {
+      return new Intl.DateTimeFormat("zh-CN", {
+        hour: "2-digit",
+        minute: "2-digit"
+      }).format(new Date());
+    }
+
+    function updateClock() {
+      $("clock").textContent = new Intl.DateTimeFormat("zh-CN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit"
+      }).format(new Date());
+    }
+
+    bindInteractions();
+    loadRuntime();
+    loadPeers();
+    updateClock();
+    setInterval(loadPeers, 1500);
+    setInterval(updateClock, 1000);
+  </script>
+</body>
+</html>
