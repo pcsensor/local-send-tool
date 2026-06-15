@@ -341,7 +341,7 @@
       grid-template-columns: 42px 1fr;
       gap: 10px;
       align-items: center;
-      min-width: 260px;
+      min-width: 0;
       margin-top: 2px;
       border-radius: 10px;
       background:
@@ -914,7 +914,21 @@
       const item = { name: file.name, type, size: formatSize(file.size), progress: 3 };
       state.queue.unshift(item);
       $("messages").insertAdjacentHTML("beforeend", queueBubble(item));
-      $("messages").lastElementChild.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      const node = $("messages").lastElementChild;
+      node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      return node;
+    }
+
+    function updateFileProgress(node, progress) {
+      if (!node) return;
+      const bar = node.querySelector(".bar i");
+      const sub = node.querySelector(".file-sub");
+      if (bar) bar.style.width = `${progress}%`;
+      if (sub) {
+        const sizeMatch = sub.textContent.match(/^[\d.]+\s*[KMG]?B/);
+        const sizeText = sizeMatch ? sizeMatch[0] : "";
+        sub.textContent = `${sizeText} / ${progress >= 100 ? "已完成" : "上传中"} / ${Math.round(progress)}%`;
+      }
     }
 
     function selectedTarget() {
@@ -934,19 +948,43 @@
       return result;
     }
 
-    async function sendFile(file) {
-      const form = new FormData();
-      form.append("target", selectedTarget());
-      form.append("file", file);
-      const response = await fetch("/api/web/file", {
-        method: "POST",
-        body: form
+    function sendFile(file, onProgress) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        const form = new FormData();
+        form.append("target", selectedTarget());
+        form.append("file", file);
+
+        xhr.upload.addEventListener("progress", (e) => {
+          if (e.lengthComputable && onProgress) {
+            const percent = Math.round((e.loaded / e.total) * 100);
+            onProgress(percent);
+          }
+        });
+
+        xhr.addEventListener("load", () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              resolve(JSON.parse(xhr.responseText));
+            } catch {
+              resolve({ delivered: 0 });
+            }
+          } else {
+            try {
+              const result = JSON.parse(xhr.responseText);
+              reject(new Error(result.message || "文件发送失败"));
+            } catch {
+              reject(new Error("文件发送失败"));
+            }
+          }
+        });
+
+        xhr.addEventListener("error", () => reject(new Error("网络错误")));
+        xhr.addEventListener("abort", () => reject(new Error("已取消")));
+
+        xhr.open("POST", "/api/web/file");
+        xhr.send(form);
       });
-      const result = await response.json().catch(() => ({ message: "文件发送失败" }));
-      if (!response.ok) {
-        throw new Error(result.message || "文件发送失败");
-      }
-      return result;
     }
 
     function escapeHtml(value) {
@@ -1083,9 +1121,9 @@
         const file = event.target.files[0];
         event.target.value = "";
         if (!file) return;
-        addFileMessage(file);
+        const fileNode = addFileMessage(file);
         try {
-          const result = await sendFile(file);
+          const result = await sendFile(file, (p) => updateFileProgress(fileNode, p));
           addSystemMessage(`文件已送达 ${result.delivered} 个节点。`);
         } catch (error) {
           addSystemMessage(`文件发送失败：${error.message}`);
@@ -1097,9 +1135,9 @@
         event.preventDefault();
         const file = event.dataTransfer.files[0];
         if (!file) return;
-        addFileMessage(file);
+        const fileNode = addFileMessage(file);
         try {
-          const result = await sendFile(file);
+          const result = await sendFile(file, (p) => updateFileProgress(fileNode, p));
           addSystemMessage(`文件已送达 ${result.delivered} 个节点。`);
         } catch (error) {
           addSystemMessage(`文件发送失败：${error.message}`);
