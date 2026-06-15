@@ -152,20 +152,6 @@ enum Commands {
         #[arg(long)]
         chunk_concurrency: Option<usize>,
     },
-    /// Launch the interactive TUI (Discord-style chat interface)
-    Tui {
-        /// Port to bind the HTTP server
-        #[arg(short, long)]
-        port: Option<u16>,
-
-        /// Peer name (alias) for this node
-        #[arg(short, long)]
-        name: Option<String>,
-
-        /// 指定局域网网卡 IP（开启 TUN 代理时使用，例如 192.168.1.5）
-        #[arg(long, value_name = "IP")]
-        bind_ip: Option<String>,
-    },
     /// Launch the next-generation Web UI preview
     Web {
         /// Download directory for incoming files
@@ -645,30 +631,6 @@ async fn main() {
                 }
             }
         }
-        Commands::Tui {
-            port,
-            name,
-            bind_ip,
-        } => {
-            let settings = lan_share::config::resolve_serve_settings(
-                &required_home_dir(),
-                lan_share::config::ConfigOverrides {
-                    port,
-                    name,
-                    bind_ip,
-                    ..lan_share::config::ConfigOverrides::default()
-                },
-                &env_config,
-                &app_config,
-            );
-            let bind_ip = parse_bind_ip(settings.bind_ip.as_deref());
-            let actual_port = settings.port;
-
-            if let Err(e) = lan_share::tui::run_tui(app_config, bind_ip, actual_port).await {
-                eprintln!("TUI error: {}", e);
-                std::process::exit(1);
-            }
-        }
         Commands::Web {
             dir,
             port,
@@ -780,7 +742,6 @@ async fn main() {
             let app = lan_share::server::make_router_with_events_and_info(
                 registry,
                 settings.download_dir,
-                None,
                 Some(web_info),
                 Some(sse_tx),
             );
@@ -934,6 +895,39 @@ mod tests {
             }
             _ => panic!("expected send-files command"),
         }
+    }
+
+    #[test]
+    fn interactive_tui_command_is_not_available() {
+        let error = match Cli::try_parse_from(["lan-share", "tui"]) {
+            Ok(_) => panic!("interactive tui command should not be available"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn web_and_cli_transfer_commands_remain_available() {
+        assert!(matches!(
+            Cli::try_parse_from(["lan-share", "web", "--port", "0"])
+                .unwrap()
+                .command,
+            Commands::Web { port: Some(0), .. }
+        ));
+
+        assert!(matches!(
+            Cli::try_parse_from(["lan-share", "send-text", "--to", "127.0.0.1:8080", "hi"])
+                .unwrap()
+                .command,
+            Commands::SendText { .. }
+        ));
+
+        assert!(matches!(
+            Cli::try_parse_from(["lan-share", "send-file", "--to", "127.0.0.1:8080", "a.txt"])
+                .unwrap()
+                .command,
+            Commands::SendFile { .. }
+        ));
     }
 
     #[tokio::test]

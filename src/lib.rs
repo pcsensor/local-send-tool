@@ -3,7 +3,6 @@ pub mod config;
 pub mod discovery;
 pub mod peer;
 pub mod server;
-pub mod tui;
 pub mod web_ui;
 
 /// Find an available TCP port starting from `start_port`.

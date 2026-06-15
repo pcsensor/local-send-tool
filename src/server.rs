@@ -1,7 +1,6 @@
 use crate::client::{send_file_with_options, send_text, FileSendOptions, ProgressMode};
 use crate::peer::Peer;
 use crate::peer::PeerRegistry;
-use crate::tui::TuiEvent;
 use crate::web_ui::{self, SseMessage, WebRuntimeInfo};
 use axum::{
     body::Body,
@@ -24,9 +23,8 @@ use std::{
     sync::Arc,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::{Mutex, Notify};
 use tokio::sync::broadcast::Sender as BroadcastSender;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::io::StreamReader;
 
 type UploadSessions = Arc<Mutex<HashMap<String, UploadSessionEntry>>>;
@@ -36,7 +34,6 @@ pub struct ServerState {
     pub registry: PeerRegistry,
     pub download_dir: PathBuf,
     upload_sessions: UploadSessions,
-    event_tx: Option<UnboundedSender<TuiEvent>>,
     web_info: Option<WebRuntimeInfo>,
     sse_tx: Option<BroadcastSender<String>>,
 }
@@ -105,22 +102,12 @@ struct InitUploadResponse {
 }
 
 pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
-    make_router_with_events(registry, download_dir, None, None)
-}
-
-pub fn make_router_with_events(
-    registry: PeerRegistry,
-    download_dir: PathBuf,
-    event_tx: Option<UnboundedSender<TuiEvent>>,
-    sse_tx: Option<BroadcastSender<String>>,
-) -> Router {
-    make_router_with_events_and_info(registry, download_dir, event_tx, None, sse_tx)
+    make_router_with_events_and_info(registry, download_dir, None, None)
 }
 
 pub fn make_router_with_events_and_info(
     registry: PeerRegistry,
     download_dir: PathBuf,
-    event_tx: Option<UnboundedSender<TuiEvent>>,
     web_info: Option<WebRuntimeInfo>,
     sse_tx: Option<BroadcastSender<String>>,
 ) -> Router {
@@ -128,7 +115,6 @@ pub fn make_router_with_events_and_info(
         registry,
         download_dir,
         upload_sessions: Arc::new(Mutex::new(HashMap::new())),
-        event_tx,
         web_info,
         sse_tx,
     };
@@ -153,7 +139,10 @@ pub fn make_router_with_events_and_info(
         .route("/api/peers", get(handle_peers))
         .route("/api/runtime", get(handle_runtime))
         .route("/api/events", get(handle_sse_events))
-        .route("/api/config", get(handle_get_config).post(handle_save_config))
+        .route(
+            "/api/config",
+            get(handle_get_config).post(handle_save_config),
+        )
         .route(
             "/api/web/message",
             post(handle_web_message).layer(DefaultBodyLimit::max(1024 * 1024)),
@@ -241,16 +230,31 @@ async fn handle_save_config(
     if let Some(path) = &config_path {
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message": format!("无法创建配置目录: {}", e)}))).into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"message": format!("无法创建配置目录: {}", e)})),
+                )
+                    .into_response();
             }
         }
         let content = toml::to_string_pretty(&config).unwrap_or_default();
         if let Err(e) = std::fs::write(path, content) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message": format!("无法写入配置文件: {}", e)}))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"message": format!("无法写入配置文件: {}", e)})),
+            )
+                .into_response();
         }
-        Json(ConfigResponse { defaults: config.defaults }).into_response()
+        Json(ConfigResponse {
+            defaults: config.defaults,
+        })
+        .into_response()
     } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"message": "无法确定配置文件路径"}))).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"message": "无法确定配置文件路径"})),
+        )
+            .into_response()
     }
 }
 
@@ -561,12 +565,6 @@ async fn handle_message(
         "\n[收到来自 {} 的文字消息]: {}",
         payload.sender_name, payload.text
     );
-    if let Some(tx) = &state.event_tx {
-        let _ = tx.send(TuiEvent::MessageReceived {
-            sender: payload.sender_name.clone(),
-            text: payload.text.clone(),
-        });
-    }
     // Broadcast SSE event for web clients
     if let Some(sse_tx) = &state.sse_tx {
         let msg = SseMessage::message(payload.sender_name.clone(), payload.text.clone());
@@ -700,14 +698,6 @@ async fn handle_file(
         sender_name,
         final_path.display()
     );
-
-    if let Some(tx) = &state.event_tx {
-        let _ = tx.send(TuiEvent::FileReceived {
-            sender: sender_name.clone(),
-            file_name: file_name.clone(),
-            file_size: received_bytes,
-        });
-    }
 
     // Broadcast SSE event for web clients
     if let Some(sse_tx) = &state.sse_tx {
@@ -960,16 +950,13 @@ async fn handle_file_complete(
                 session.final_path.display()
             );
 
-            if let Some(tx) = &state.event_tx {
-                let _ = tx.send(TuiEvent::FileReceived {
-                    sender: session.sender_name.clone(),
-                    file_name: file_name.clone(),
-                    file_size: session.file_size,
-                });
-            }
             // Broadcast SSE event for web clients
             if let Some(sse_tx) = &state.sse_tx {
-                let msg = SseMessage::file(session.sender_name.clone(), file_name.clone(), session.file_size);
+                let msg = SseMessage::file(
+                    session.sender_name.clone(),
+                    file_name.clone(),
+                    session.file_size,
+                );
                 if let Ok(json) = serde_json::to_string(&msg) {
                     let _ = sse_tx.send(json);
                 }
@@ -1847,7 +1834,6 @@ mod tests {
             registry,
             download_dir: tmp_dir.path().to_path_buf(),
             upload_sessions: upload_sessions.clone(),
-            event_tx: None,
             web_info: None,
             sse_tx: None,
         };
@@ -2199,7 +2185,6 @@ mod tests {
             registry: registry.clone(),
             download_dir: download_dir.clone(),
             upload_sessions: sessions.clone(),
-            event_tx: None,
             web_info: None,
             sse_tx: None,
         };
@@ -2294,7 +2279,6 @@ mod tests {
             registry: registry.clone(),
             download_dir: download_dir.clone(),
             upload_sessions: sessions_safe.clone(),
-            event_tx: None,
             web_info: None,
             sse_tx: None,
         };
