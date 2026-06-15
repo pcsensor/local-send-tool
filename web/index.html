@@ -260,8 +260,10 @@
     }
 
     .messages {
+      flex: 1;
       min-height: 0;
-      overflow: auto;
+      overflow-y: auto;
+      overflow-x: hidden;
       padding: 18px 22px 14px;
       display: flex;
       flex-direction: column;
@@ -342,6 +344,7 @@
       gap: 10px;
       align-items: center;
       min-width: 0;
+      max-width: 100%;
       margin-top: 2px;
       border-radius: 10px;
       background:
@@ -361,6 +364,12 @@
       font-family: var(--mono);
       font-size: 11px;
       font-weight: 800;
+      flex-shrink: 0;
+    }
+
+    .file-info {
+      min-width: 0;
+      overflow: hidden;
     }
 
     .file-title {
@@ -373,6 +382,10 @@
     }
 
     .file-sub {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
       color: rgba(74, 54, 20, 0.62);
       font-size: 12px;
     }
@@ -383,6 +396,7 @@
       border-radius: 999px;
       background: rgba(109, 81, 31, 0.14);
       margin-top: 7px;
+      max-width: 100%;
     }
 
     .bar i {
@@ -875,7 +889,7 @@
             <span class="name">传输助手</span>
             <div class="file-card">
               <div class="file-icon">${escapeHtml(item.type)}</div>
-              <div>
+              <div class="file-info">
                 <span class="file-title">${escapeHtml(item.name)}</span>
                 <span class="file-sub">${escapeHtml(item.size)} / ${item.progress >= 100 ? "已完成" : "上传中"} / ${Math.round(item.progress)}%</span>
                 <div class="bar"><i style="width:${item.progress}%"></i></div>
@@ -1207,7 +1221,7 @@
           <span class="name">${escapeHtml(sender)}</span>
           <div class="file-card">
             <div class="file-icon">${escapeHtml(type)}</div>
-            <div>
+            <div class="file-info">
               <span class="file-title">${escapeHtml(fileName)}</span>
               <span class="file-sub">${escapeHtml(formatSize(fileSize || 0))} / 已接收</span>
               <div class="bar"><i style="width:100%"></i></div>
