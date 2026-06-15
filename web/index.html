@@ -811,7 +811,22 @@
     const state = {
       peers: [],
       selected: null,
-      queue: []
+      conversations: {
+        group: [
+          { id: "group-day", kind: "day", text: "今天" },
+          { id: "group-system", kind: "system", text: "已加入 UDP 发现 / 组播 224.0.0.188:50001 / 已启用 SHA-256 校验" },
+          {
+            id: "group-welcome",
+            kind: "text",
+            direction: "in",
+            sender: "快传助手",
+            text: "欢迎使用局域网快传，发送文件或文字会显示在消息流中。",
+            time: "刚刚"
+          }
+        ]
+      },
+      messageSeq: 0,
+      selfName: "arch"
     };
 
     const $ = (id) => document.getElementById(id);
@@ -825,29 +840,85 @@
       return `${ip}:${peer.port}`;
     }
 
+    function currentConversationId() {
+      return state.selected ? `peer:${state.selected.uuid}` : "group";
+    }
+
+    function ensureConversation(conversationId) {
+      if (!state.conversations[conversationId]) {
+        state.conversations[conversationId] = [];
+      }
+      return state.conversations[conversationId];
+    }
+
+    function nextMessageId() {
+      state.messageSeq += 1;
+      return `msg-${Date.now()}-${state.messageSeq}`;
+    }
+
+    function conversationIdForSender(sender) {
+      const peer = state.peers.find((item) => item.name === sender);
+      return peer ? `peer:${peer.uuid}` : `peer:${sender}`;
+    }
+
+    function mergeNamedConversation(peer) {
+      const namedId = `peer:${peer.name}`;
+      const peerId = `peer:${peer.uuid}`;
+      if (namedId === peerId || !state.conversations[namedId]) return;
+      ensureConversation(peerId).push(...state.conversations[namedId]);
+      delete state.conversations[namedId];
+      if (state.selected && state.selected.uuid === peer.name) {
+        state.selected = peer;
+      }
+    }
+
+    function lastMessagePreview(conversationId, fallback) {
+      const messages = state.conversations[conversationId] || [];
+      const last = [...messages].reverse().find((message) => message.kind !== "day");
+      if (!last) return fallback;
+      if (last.kind === "system") return last.text;
+      if (last.kind === "file") return `${last.direction === "out" ? "我" : last.sender}：${last.fileName}`;
+      return `${last.direction === "out" ? "我" : last.sender}：${last.text}`;
+    }
+
     function renderChats() {
       const query = $("filter").value.trim().toLowerCase();
+      const knownPeerIds = new Set(state.peers.map((peer) => peer.uuid));
+      const unknownPrivateChats = Object.keys(state.conversations)
+        .filter((id) => id.startsWith("peer:") && !knownPeerIds.has(id.slice(5)))
+        .map((id) => {
+          const name = id.slice(5);
+          return {
+            id: name,
+            title: name,
+            preview: lastMessagePreview(id, "私聊消息"),
+            active: currentConversationId() === id,
+            badge: 0,
+            initials: initials(name)
+          };
+        });
       const chats = [
         {
           id: "group",
           title: "局域网传输群",
-          preview: `${state.peers.length} 个节点在线 / 本地文件总线`,
-          active: !state.selected,
+          preview: lastMessagePreview("group", `${state.peers.length} 个节点在线 / 本地文件总线`),
+          active: currentConversationId() === "group",
           badge: state.peers.length,
           initials: "快"
         },
         ...state.peers.map((peer) => ({
           id: peer.uuid,
           title: peer.name,
-          preview: bestAddress(peer),
-          active: state.selected && state.selected.uuid === peer.uuid,
+          preview: lastMessagePreview(`peer:${peer.uuid}`, bestAddress(peer)),
+          active: currentConversationId() === `peer:${peer.uuid}`,
           badge: 0,
           initials: initials(peer.name)
-        }))
+        })),
+        ...unknownPrivateChats
       ].filter((chat) => `${chat.title} ${chat.preview}`.toLowerCase().includes(query));
 
       $("chat-list").innerHTML = chats.map((chat) => `
-        <button class="chat-row${chat.active ? " active" : ""}" data-peer="${chat.id}">
+        <button class="chat-row${chat.active ? " active" : ""}" data-peer="${escapeHtml(chat.id)}" data-title="${escapeHtml(chat.title)}">
           <div class="avatar">${escapeHtml(chat.initials)}</div>
           <div class="chat-main">
             <strong>${escapeHtml(chat.title)}</strong>
@@ -862,7 +933,14 @@
 
       $("chat-list").querySelectorAll("[data-peer]").forEach((button) => {
         button.addEventListener("click", () => {
-          state.selected = state.peers.find((peer) => peer.uuid === button.dataset.peer) || null;
+          state.selected = button.dataset.peer === "group"
+            ? null
+            : state.peers.find((peer) => peer.uuid === button.dataset.peer) || {
+              uuid: button.dataset.peer,
+              name: button.dataset.title || button.dataset.peer,
+              ips: [],
+              port: "--"
+            };
           renderAll();
         });
       });
@@ -882,7 +960,9 @@
     }
 
     function renderHeader() {
-      $("peer-count").textContent = `${state.peers.length} 个节点在线 / UDP 自动发现`;
+      $("peer-count").textContent = state.selected
+        ? `${bestAddress(state.selected)} / 私聊`
+        : `${state.peers.length} 个节点在线 / UDP 自动发现`;
       $("metric-peers").textContent = String(state.peers.length);
       $("selected-name").textContent = state.selected ? state.selected.name : "局域网传输群";
     }
@@ -891,69 +971,115 @@
       renderChats();
       renderMembers();
       renderHeader();
+      renderMessages();
     }
 
-    function queueBubble(item) {
-      return `
-        <article class="msg">
-          <div class="mini">BOT</div>
-          <div class="bubble">
-            <span class="name">传输助手</span>
-            <div class="file-card">
-              <div class="file-icon">${escapeHtml(item.type)}</div>
-              <div class="file-info">
-                <span class="file-title">${escapeHtml(item.name)}</span>
-                <span class="file-sub">${escapeHtml(item.size)} / ${item.progress >= 100 ? "已完成" : "上传中"} / ${Math.round(item.progress)}%</span>
-                <div class="bar"><i style="width:${item.progress}%"></i></div>
+    function messageHtml(message) {
+      if (message.kind === "day") {
+        return `<div class="day">${escapeHtml(message.text)}</div>`;
+      }
+      if (message.kind === "system") {
+        return `<div class="system">${escapeHtml(message.text)}</div>`;
+      }
+
+      const isOutgoing = message.direction === "out";
+      const sender = isOutgoing ? state.selfName : message.sender;
+      if (message.kind === "file") {
+        const progress = Math.round(message.progress ?? 100);
+        const status = message.status || (progress >= 100 ? "已完成" : "上传中");
+        return `
+          <article class="msg${isOutgoing ? " out" : ""}" data-message-id="${escapeHtml(message.id)}">
+            <div class="mini">${escapeHtml(isOutgoing ? "ME" : initials(sender))}</div>
+            <div class="bubble">
+              <span class="name">${escapeHtml(sender)}</span>
+              <div class="file-card">
+                <div class="file-icon">${escapeHtml(message.fileType)}</div>
+                <div class="file-info">
+                  <span class="file-title">${escapeHtml(message.fileName)}</span>
+                  <span class="file-sub">${escapeHtml(message.sizeText)} / ${escapeHtml(status)}${message.direction === "out" ? ` / ${progress}%` : ""}</span>
+                  <div class="bar"><i style="width:${progress}%"></i></div>
+                </div>
               </div>
+              <span class="time">${escapeHtml(message.time)}</span>
             </div>
-            <span class="time">${shortTime()}</span>
+          </article>
+        `;
+      }
+
+      return `
+        <article class="msg${isOutgoing ? " out" : ""}" data-message-id="${escapeHtml(message.id)}">
+          <div class="mini">${escapeHtml(isOutgoing ? "ME" : initials(sender))}</div>
+          <div class="bubble">
+            <span class="name">${escapeHtml(sender)}</span>
+            ${escapeHtml(message.text)}<span class="time">${escapeHtml(message.time)}</span>
           </div>
         </article>
       `;
     }
 
+    function renderMessages() {
+      const messages = ensureConversation(currentConversationId());
+      $("messages").innerHTML = messages.map(messageHtml).join("");
+      const last = $("messages").lastElementChild;
+      if (last) last.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+
+    function appendConversationMessage(conversationId, message) {
+      const entry = {
+        id: nextMessageId(),
+        time: shortTime(),
+        ...message
+      };
+      ensureConversation(conversationId).push(entry);
+      if (conversationId === currentConversationId()) {
+        renderMessages();
+      }
+      renderChats();
+      return entry.id;
+    }
+
     function addMessage(text) {
-      const node = document.createElement("article");
-      node.className = "msg out";
-      node.innerHTML = `
-        <div class="mini">ME</div>
-        <div class="bubble">
-          <span class="name">arch</span>
-          ${escapeHtml(text)}<span class="time">${shortTime()}</span>
-        </div>
-      `;
-      $("messages").appendChild(node);
-      node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      appendConversationMessage(currentConversationId(), {
+        kind: "text",
+        direction: "out",
+        sender: state.selfName,
+        text
+      });
     }
 
     function addSystemMessage(text) {
-      const node = document.createElement("div");
-      node.className = "system";
-      node.textContent = text;
-      $("messages").appendChild(node);
-      node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      appendConversationMessage(currentConversationId(), {
+        kind: "system",
+        text
+      });
     }
 
     function addFileMessage(file) {
       const type = file.name.split(".").pop()?.slice(0, 3).toUpperCase() || "BIN";
-      const item = { name: file.name, type, size: formatSize(file.size), progress: 3 };
-      state.queue.unshift(item);
-      $("messages").insertAdjacentHTML("beforeend", queueBubble(item));
-      const node = $("messages").lastElementChild;
-      node.scrollIntoView({ behavior: "smooth", block: "nearest" });
-      return node;
+      return appendConversationMessage(currentConversationId(), {
+        kind: "file",
+        direction: "out",
+        sender: state.selfName,
+        fileName: file.name,
+        fileType: type,
+        sizeText: formatSize(file.size),
+        progress: 3,
+        status: "上传中"
+      });
     }
 
-    function updateFileProgress(node, progress) {
-      if (!node) return;
-      const bar = node.querySelector(".bar i");
-      const sub = node.querySelector(".file-sub");
-      if (bar) bar.style.width = `${progress}%`;
-      if (sub) {
-        const sizeMatch = sub.textContent.match(/^[\d.]+\s*[KMG]?B/);
-        const sizeText = sizeMatch ? sizeMatch[0] : "";
-        sub.textContent = `${sizeText} / ${progress >= 100 ? "已完成" : "上传中"} / ${Math.round(progress)}%`;
+    function updateFileProgress(messageId, progress) {
+      if (!messageId) return;
+      for (const [conversationId, messages] of Object.entries(state.conversations)) {
+        const message = messages.find((item) => item.id === messageId);
+        if (!message) continue;
+        message.progress = progress;
+        message.status = progress >= 100 ? "已完成" : "上传中";
+        if (conversationId === currentConversationId()) {
+          renderMessages();
+        }
+        renderChats();
+        return;
       }
     }
 
@@ -1025,6 +1151,7 @@
     async function loadRuntime() {
       try {
         const info = await fetch("/api/runtime").then((response) => response.json());
+        state.selfName = info.node_name || state.selfName;
         $("runtime-line").textContent = `${info.node_name} / ${location.host}`;
         $("metric-node").textContent = info.node_name;
         $("metric-port").textContent = String(info.port);
@@ -1048,6 +1175,7 @@
       const started = performance.now();
       try {
         state.peers = await fetch("/api/peers").then((response) => response.json());
+        state.peers.forEach(mergeNamedConversation);
         $("latency").textContent = `${Math.max(1, Math.round(performance.now() - started))}ms`;
       } catch {
         $("latency").textContent = "离线";
@@ -1147,9 +1275,10 @@
         const file = event.target.files[0];
         event.target.value = "";
         if (!file) return;
-        const fileNode = addFileMessage(file);
+        const fileMessageId = addFileMessage(file);
         try {
-          const result = await sendFile(file, (p) => updateFileProgress(fileNode, p));
+          const result = await sendFile(file, (p) => updateFileProgress(fileMessageId, p));
+          updateFileProgress(fileMessageId, 100);
           addSystemMessage(`文件已送达 ${result.delivered} 个节点。`);
         } catch (error) {
           addSystemMessage(`文件发送失败：${error.message}`);
@@ -1161,9 +1290,10 @@
         event.preventDefault();
         const file = event.dataTransfer.files[0];
         if (!file) return;
-        const fileNode = addFileMessage(file);
+        const fileMessageId = addFileMessage(file);
         try {
-          const result = await sendFile(file, (p) => updateFileProgress(fileNode, p));
+          const result = await sendFile(file, (p) => updateFileProgress(fileMessageId, p));
+          updateFileProgress(fileMessageId, 100);
           addSystemMessage(`文件已送达 ${result.delivered} 个节点。`);
         } catch (error) {
           addSystemMessage(`文件发送失败：${error.message}`);
@@ -1210,40 +1340,26 @@
     }
 
     function addReceivedMessage(sender, text) {
-      const node = document.createElement("article");
-      node.className = "msg";
-      node.innerHTML = `
-        <div class="mini">${escapeHtml(initials(sender))}</div>
-        <div class="bubble">
-          <span class="name">${escapeHtml(sender)}</span>
-          ${escapeHtml(text)}<span class="time">${shortTime()}</span>
-        </div>
-      `;
-      $("messages").appendChild(node);
-      node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      appendConversationMessage(conversationIdForSender(sender), {
+        kind: "text",
+        direction: "in",
+        sender,
+        text
+      });
     }
 
     function addReceivedFileMessage(sender, fileName, fileSize) {
       const type = fileName.split(".").pop()?.slice(0, 3).toUpperCase() || "BIN";
-      const node = document.createElement("article");
-      node.className = "msg";
-      node.innerHTML = `
-        <div class="mini">${escapeHtml(initials(sender))}</div>
-        <div class="bubble">
-          <span class="name">${escapeHtml(sender)}</span>
-          <div class="file-card">
-            <div class="file-icon">${escapeHtml(type)}</div>
-            <div class="file-info">
-              <span class="file-title">${escapeHtml(fileName)}</span>
-              <span class="file-sub">${escapeHtml(formatSize(fileSize || 0))} / 已接收</span>
-              <div class="bar"><i style="width:100%"></i></div>
-            </div>
-          </div>
-          <span class="time">${shortTime()}</span>
-        </div>
-      `;
-      $("messages").appendChild(node);
-      node.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      appendConversationMessage(conversationIdForSender(sender), {
+        kind: "file",
+        direction: "in",
+        sender,
+        fileName,
+        fileType: type,
+        sizeText: formatSize(fileSize || 0),
+        progress: 100,
+        status: "已接收"
+      });
     }
 
     function connectSSE() {

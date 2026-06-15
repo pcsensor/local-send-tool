@@ -175,4 +175,28 @@ mod tests {
             "mobile layout must keep the composer at the bottom of the viewport"
         );
     }
+
+    #[test]
+    fn web_chat_keeps_group_and_private_histories_separate() {
+        assert!(
+            INDEX_HTML.contains("conversations:"),
+            "web UI should keep message history in per-conversation state"
+        );
+        assert!(
+            INDEX_HTML.contains("function currentConversationId()"),
+            "web UI should derive a stable conversation id from the selected chat"
+        );
+        assert!(
+            INDEX_HTML.contains("function renderMessages()"),
+            "switching chats should render only the selected conversation history"
+        );
+        assert!(
+            INDEX_HTML.contains("appendConversationMessage(currentConversationId()"),
+            "locally sent messages should be appended to the active conversation"
+        );
+        assert!(
+            INDEX_HTML.contains("conversationIdForSender"),
+            "received messages should be routed to the sender's private conversation"
+        );
+    }
 }
