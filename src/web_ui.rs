@@ -94,3 +94,85 @@ pub async fn sse_events(
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::INDEX_HTML;
+
+    fn css_rule(selector: &str) -> &str {
+        let selector = format!("{selector} {{");
+        let start = INDEX_HTML
+            .find(&selector)
+            .unwrap_or_else(|| panic!("missing CSS selector: {selector}"));
+        let after_selector = &INDEX_HTML[start..];
+        let open = after_selector
+            .find('{')
+            .unwrap_or_else(|| panic!("missing CSS block for selector: {selector}"));
+        let after_open = &after_selector[open + 1..];
+        let close = after_open
+            .find('}')
+            .unwrap_or_else(|| panic!("unterminated CSS block for selector: {selector}"));
+        &after_open[..close]
+    }
+
+    #[test]
+    fn chat_layout_keeps_composer_visible_and_history_scrollable() {
+        let app_rule = css_rule(".app");
+        assert!(
+            app_rule.contains("height: 100dvh"),
+            "the app shell must stay bound to the viewport"
+        );
+        assert!(
+            app_rule.contains("overflow: hidden"),
+            "page overflow should not push the composer off-screen"
+        );
+        assert!(
+            app_rule.contains("grid-template-rows: minmax(0, 1fr)"),
+            "the app grid row must not expand to fit tall side panels"
+        );
+
+        let chats_rule = css_rule(".chats");
+        assert!(
+            chats_rule.contains("min-height: 0"),
+            "the chats sidebar must not increase the app grid height"
+        );
+
+        let chat_rule = css_rule(".chat");
+        assert!(
+            chat_rule.contains("min-height: 0"),
+            "the chat grid item must be allowed to shrink inside the viewport"
+        );
+        assert!(
+            chat_rule.contains("overflow: hidden"),
+            "only the message history should scroll, not the whole chat panel"
+        );
+
+        let info_rule = css_rule(".info");
+        assert!(
+            info_rule.contains("min-height: 0"),
+            "the info sidebar must not increase the app grid height"
+        );
+
+        let messages_rule = css_rule(".messages");
+        assert!(
+            messages_rule.contains("overflow-y: auto"),
+            "message history should remain vertically scrollable"
+        );
+
+        let mobile_rule_start = INDEX_HTML
+            .find("@media (max-width: 760px)")
+            .expect("missing mobile layout rule");
+        let style_end = INDEX_HTML[mobile_rule_start..]
+            .find("</style>")
+            .expect("missing style close tag");
+        let mobile_rules = &INDEX_HTML[mobile_rule_start..mobile_rule_start + style_end];
+        assert!(
+            !mobile_rules.contains("overflow: auto"),
+            "mobile layout must not fall back to document scrolling"
+        );
+        assert!(
+            mobile_rules.contains("height: 100dvh"),
+            "mobile layout must keep the composer at the bottom of the viewport"
+        );
+    }
+}

@@ -68,13 +68,17 @@
     .app {
       display: grid;
       grid-template-columns: 330px minmax(480px, 1fr) 310px;
+      grid-template-rows: minmax(0, 1fr);
       height: 100vh;
+      height: 100dvh;
+      overflow: hidden;
       position: relative;
       z-index: 1;
     }
 
     .chats {
       min-width: 0;
+      min-height: 0;
       border-right: 1px solid var(--line);
       background: var(--sidebar);
       display: grid;
@@ -204,6 +208,8 @@
 
     .chat {
       min-width: 0;
+      min-height: 0;
+      overflow: hidden;
       display: grid;
       grid-template-rows: 56px 1fr auto;
       background:
@@ -264,6 +270,7 @@
       min-height: 0;
       overflow-y: auto;
       overflow-x: hidden;
+      overscroll-behavior: contain;
       padding: 18px 22px 14px;
       display: flex;
       flex-direction: column;
@@ -421,9 +428,11 @@
     .composer {
       display: grid;
       grid-template-columns: auto 1fr auto auto;
+      flex: 0 0 auto;
       gap: 8px;
       align-items: center;
       padding: 10px 16px 14px;
+      border-top: 1px solid var(--line);
       background: linear-gradient(180deg, transparent, rgba(251, 247, 239, 0.96) 18%);
     }
 
@@ -441,6 +450,7 @@
 
     .info {
       min-width: 0;
+      min-height: 0;
       border-left: 1px solid var(--line);
       background: #fffdf8;
       display: grid;
@@ -584,23 +594,25 @@
 
     @media (max-width: 760px) {
       body {
-        overflow: auto;
+        overflow: hidden;
       }
 
       .app {
         grid-template-columns: 1fr;
-        height: auto;
-        min-height: 100vh;
+        grid-template-rows: minmax(0, 34vh) minmax(0, 1fr);
+        height: 100vh;
+        height: 100dvh;
+        min-height: 0;
       }
 
       .chats {
-        min-height: 360px;
+        min-height: 0;
         border-right: 0;
         border-bottom: 1px solid var(--line);
       }
 
       .chat {
-        min-height: 620px;
+        min-height: 0;
       }
     }
   </style>
