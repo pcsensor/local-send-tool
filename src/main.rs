@@ -176,33 +176,9 @@ async fn find_available_port(
     bind_ip: Option<std::net::Ipv4Addr>,
     start_port: u16,
 ) -> (tokio::net::TcpListener, u16) {
-    let mut actual_port = start_port;
-    let ip = bind_ip.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-    loop {
-        let addr = std::net::SocketAddr::from((ip, actual_port));
-        match tokio::net::TcpListener::bind(&addr).await {
-            Ok(listener) => {
-                let port = listener
-                    .local_addr()
-                    .map(|a| a.port())
-                    .unwrap_or(actual_port);
-                return (listener, port);
-            }
-            Err(e) => {
-                if start_port == 0 || e.kind() != std::io::ErrorKind::AddrInUse {
-                    panic!("Failed to bind to auto-allocated port: {}", e);
-                }
-                println!(
-                    "Port {} is occupied (error: {}). Trying next port...",
-                    actual_port, e
-                );
-                if actual_port == u16::MAX {
-                    panic!("Failed to find any free port");
-                }
-                actual_port += 1;
-            }
-        }
-    }
+    lan_share::find_available_port(bind_ip, start_port)
+        .await
+        .unwrap_or_else(|e| panic!("Failed to bind to port: {}", e))
 }
 
 /// 将 --bind-ip 字符串解析为 Ipv4Addr，无效时打印错误并退出
@@ -374,7 +350,12 @@ async fn main() {
             println!("Server UUID: {}", peer.uuid);
             println!("Serving on http://{}", listener.local_addr().unwrap());
 
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            {
                 eprintln!("Server exited with error: {}", e);
             }
         }
@@ -752,7 +733,12 @@ async fn main() {
             println!("Server UUID: {}", peer.uuid);
             println!("Web 界面: http://{}", addr);
 
-            if let Err(e) = axum::serve(listener, app).await {
+            if let Err(e) = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            {
                 eprintln!("Web UI server exited with error: {}", e);
             }
         }

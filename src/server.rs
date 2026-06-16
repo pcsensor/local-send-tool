@@ -4,7 +4,7 @@ use crate::peer::PeerRegistry;
 use crate::web_ui::{self, SseMessage, WebRuntimeInfo};
 use axum::{
     body::Body,
-    extract::{multipart::Field, DefaultBodyLimit, Multipart, Path as AxumPath, State},
+    extract::{multipart::Field, ConnectInfo, DefaultBodyLimit, Multipart, Path as AxumPath, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post, put},
@@ -18,6 +18,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     future::Future,
     io,
+    net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
     sync::Arc,
@@ -26,6 +27,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast::Sender as BroadcastSender;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::io::StreamReader;
+
+/// Reject control-plane requests that do not originate from the local machine.
+/// Receiving endpoints stay open to the LAN; config/runtime/web-send endpoints
+/// must only be driven from localhost.
+async fn require_localhost(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match connect_info {
+        Some(ConnectInfo(addr)) if addr.ip().is_loopback() => next.run(request).await,
+        _ => StatusCode::FORBIDDEN.into_response(),
+    }
+}
 
 type UploadSessions = Arc<Mutex<HashMap<String, UploadSessionEntry>>>;
 
@@ -133,12 +148,8 @@ pub fn make_router_with_events_and_info(
         }
     });
 
-    Router::new()
-        .route("/", get(web_ui::index))
-        .route("/app", get(web_ui::index))
-        .route("/api/peers", get(handle_peers))
+    let control_plane = Router::new()
         .route("/api/runtime", get(handle_runtime))
-        .route("/api/events", get(handle_sse_events))
         .route(
             "/api/config",
             get(handle_get_config).post(handle_save_config),
@@ -151,6 +162,14 @@ pub fn make_router_with_events_and_info(
             "/api/web/file",
             post(handle_web_file).layer(DefaultBodyLimit::max(max_file_limit)),
         )
+        .route_layer(axum::middleware::from_fn(require_localhost));
+
+    Router::new()
+        .route("/", get(web_ui::index))
+        .route("/app", get(web_ui::index))
+        .route("/api/peers", get(handle_peers))
+        .route("/api/events", get(handle_sse_events))
+        .merge(control_plane)
         .route(
             "/api/message",
             post(handle_message).layer(DefaultBodyLimit::max(1024 * 1024)),
@@ -1383,6 +1402,70 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(content);
         format!("{:x}", hasher.finalize())
+    }
+
+    fn control_plane_request(method: &str, uri: &str, remote: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if method == "POST" {
+            builder = builder.header("content-type", "application/json");
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        if let Some(remote) = remote {
+            let addr: SocketAddr = remote.parse().unwrap();
+            request.extensions_mut().insert(ConnectInfo(addr));
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn test_control_plane_allows_localhost() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+
+        let request = control_plane_request("GET", "/api/config", Some("127.0.0.1:54321"));
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_control_plane_rejects_remote_address() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+
+        let request = control_plane_request("GET", "/api/config", Some("192.168.1.50:54321"));
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_control_plane_rejects_missing_connect_info() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+
+        let request = control_plane_request("POST", "/api/config", None);
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_receiving_endpoint_stays_open_without_connect_info() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/message")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"sender_name": "remote", "text": "hi"}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
