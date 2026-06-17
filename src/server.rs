@@ -4,8 +4,10 @@ use crate::peer::PeerRegistry;
 use crate::web_ui::{self, SseMessage, WebRuntimeInfo};
 use axum::{
     body::Body,
-    extract::{multipart::Field, ConnectInfo, DefaultBodyLimit, Multipart, Path as AxumPath, State},
-    http::StatusCode,
+    extract::{
+        multipart::Field, ConnectInfo, DefaultBodyLimit, Multipart, Path as AxumPath, State,
+    },
+    http::{header, HeaderMap, StatusCode, Uri},
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
@@ -29,8 +31,8 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::io::StreamReader;
 
 /// Reject control-plane requests that do not originate from the local machine.
-/// Receiving endpoints stay open to the LAN; config/runtime/web-send endpoints
-/// must only be driven from localhost.
+/// Receiving endpoints stay open to the LAN; config endpoints must only be
+/// driven from localhost.
 async fn require_localhost(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     request: axum::extract::Request,
@@ -40,6 +42,79 @@ async fn require_localhost(
         Some(ConnectInfo(addr)) if addr.ip().is_loopback() => next.run(request).await,
         _ => StatusCode::FORBIDDEN.into_response(),
     }
+}
+
+/// Allow Web UI actions from the local machine or from the same-origin page
+/// served by this node. This lets a LAN browser use the Web UI without opening
+/// config mutation endpoints to the network.
+async fn require_web_ui_request(
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_loopback = matches!(
+        connect_info,
+        Some(ConnectInfo(addr)) if addr.ip().is_loopback()
+    );
+    let is_same_origin = request_has_same_origin(&request);
+
+    if is_loopback || is_same_origin {
+        next.run(request).await
+    } else {
+        web_send_error(StatusCode::FORBIDDEN, "Web 接口只接受本机或同源页面请求")
+    }
+}
+
+fn request_has_same_origin(request: &axum::extract::Request) -> bool {
+    let headers = request.headers();
+    if let Some(fetch_site) = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+    {
+        if fetch_site.eq_ignore_ascii_case("same-origin") {
+            return true;
+        }
+    }
+
+    let Some(host) = header_value(headers, header::HOST).map(normalize_authority) else {
+        return false;
+    };
+
+    if let Some(origin) = header_value(headers, header::ORIGIN) {
+        return origin
+            .split_whitespace()
+            .any(|candidate| uri_authority_matches(candidate, &host));
+    }
+
+    if let Some(referer) = header_value(headers, header::REFERER) {
+        return uri_authority_matches(referer, &host);
+    }
+
+    false
+}
+
+fn header_value(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn uri_authority_matches(value: &str, expected_authority: &str) -> bool {
+    let Ok(uri) = value.parse::<Uri>() else {
+        return false;
+    };
+    let Some(scheme) = uri.scheme_str() else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+
+    uri.authority()
+        .map(|authority| normalize_authority(authority.as_str()) == expected_authority)
+        .unwrap_or(false)
+}
+
+fn normalize_authority(authority: &str) -> String {
+    authority.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 type UploadSessions = Arc<Mutex<HashMap<String, UploadSessionEntry>>>;
@@ -148,12 +223,15 @@ pub fn make_router_with_events_and_info(
         }
     });
 
-    let control_plane = Router::new()
-        .route("/api/runtime", get(handle_runtime))
+    let local_control_plane = Router::new()
         .route(
             "/api/config",
             get(handle_get_config).post(handle_save_config),
         )
+        .route_layer(axum::middleware::from_fn(require_localhost));
+
+    let web_plane = Router::new()
+        .route("/api/runtime", get(handle_runtime))
         .route(
             "/api/web/message",
             post(handle_web_message).layer(DefaultBodyLimit::max(1024 * 1024)),
@@ -162,14 +240,15 @@ pub fn make_router_with_events_and_info(
             "/api/web/file",
             post(handle_web_file).layer(DefaultBodyLimit::max(max_file_limit)),
         )
-        .route_layer(axum::middleware::from_fn(require_localhost));
+        .route_layer(axum::middleware::from_fn(require_web_ui_request));
 
     Router::new()
         .route("/", get(web_ui::index))
         .route("/app", get(web_ui::index))
         .route("/api/peers", get(handle_peers))
         .route("/api/events", get(handle_sse_events))
-        .merge(control_plane)
+        .merge(local_control_plane)
+        .merge(web_plane)
         .route(
             "/api/message",
             post(handle_message).layer(DefaultBodyLimit::max(1024 * 1024)),
@@ -1425,6 +1504,25 @@ mod tests {
         request
     }
 
+    fn web_message_request(remote: Option<&str>, origin: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/web/message")
+            .header("content-type", "application/json")
+            .header("host", "192.168.1.10:8080");
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        let mut request = builder
+            .body(Body::from(r#"{"target":"","text":"hello"}"#))
+            .unwrap();
+        if let Some(remote) = remote {
+            let addr: SocketAddr = remote.parse().unwrap();
+            request.extensions_mut().insert(ConnectInfo(addr));
+        }
+        request
+    }
+
     #[tokio::test]
     async fn test_control_plane_allows_localhost() {
         let registry = PeerRegistry::new();
@@ -1443,6 +1541,29 @@ mod tests {
         let router = make_router(registry, tmp_dir.path().to_path_buf());
 
         let request = control_plane_request("GET", "/api/config", Some("192.168.1.50:54321"));
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_web_message_allows_same_origin_remote_address() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+
+        let request =
+            web_message_request(Some("192.168.1.50:54321"), Some("http://192.168.1.10:8080"));
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_web_message_rejects_remote_without_same_origin() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = make_router(registry, tmp_dir.path().to_path_buf());
+
+        let request = web_message_request(Some("192.168.1.50:54321"), None);
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
@@ -1468,9 +1589,7 @@ mod tests {
             .method("POST")
             .uri("/api/message")
             .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"sender_name": "remote", "text": "hi"}"#,
-            ))
+            .body(Body::from(r#"{"sender_name": "remote", "text": "hi"}"#))
             .unwrap();
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
