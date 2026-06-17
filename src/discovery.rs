@@ -107,36 +107,54 @@ pub fn get_local_ips(bind_ip: Option<Ipv4Addr>) -> Vec<String> {
     if let Some(ip) = bind_ip {
         return vec![ip.to_string()];
     }
-    let mut ips = if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
-        let mut list: Vec<String> = interfaces
-            .into_iter()
-            .filter_map(|(_, ip)| {
-                if ip.is_ipv4() && !ip.is_loopback() {
-                    Some(ip.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if list.is_empty() {
-            if let Ok(ip) = local_ip() {
-                if ip.is_ipv4() {
-                    list.push(ip.to_string());
-                }
-            }
+
+    // The IP of the interface backing the default route. We advertise this
+    // first so peers prefer the routable LAN address over VPN/tunnel or
+    // virtual-adapter addresses (e.g. utunN 10.x), which are usually not
+    // reachable from other machines.
+    let primary = match local_ip() {
+        Ok(std::net::IpAddr::V4(v4)) if !v4.is_loopback() && !v4.is_link_local() => {
+            Some(v4.to_string())
         }
-        list
-    } else if let Ok(ip) = local_ip() {
-        if ip.is_ipv4() {
-            vec![ip.to_string()]
-        } else {
-            vec![]
-        }
-    } else {
-        vec![]
+        _ => None,
     };
-    ips.sort();
-    ips.dedup();
+
+    let others: Vec<String> = if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
+        interfaces
+            .into_iter()
+            .filter_map(|(_, ip)| match ip {
+                // Drop loopback and link-local (169.254.0.0/16) addresses:
+                // neither is reachable by remote peers.
+                std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local() => {
+                    Some(v4.to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut ips = order_local_ips(primary, others);
+    if ips.is_empty() {
+        if let Ok(std::net::IpAddr::V4(v4)) = local_ip() {
+            ips.push(v4.to_string());
+        }
+    }
+    ips
+}
+
+/// Build the advertised address list: the primary (default-route) address
+/// first, followed by the remaining addresses sorted and de-duplicated.
+fn order_local_ips(primary: Option<String>, mut others: Vec<String>) -> Vec<String> {
+    others.sort();
+    others.dedup();
+    let mut ips = Vec::with_capacity(others.len() + 1);
+    if let Some(primary) = primary {
+        others.retain(|ip| ip != &primary);
+        ips.push(primary);
+    }
+    ips.extend(others);
     ips
 }
 
@@ -206,6 +224,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_order_local_ips_puts_primary_first() {
+        let ips = order_local_ips(
+            Some("192.168.100.157".to_string()),
+            vec!["10.20.0.1".to_string(), "192.168.100.157".to_string()],
+        );
+        assert_eq!(
+            ips,
+            vec!["192.168.100.157".to_string(), "10.20.0.1".to_string()],
+            "默认路由地址应排在首位，避免对端优先选择不可达的 VPN/隧道地址"
+        );
+    }
+
+    #[test]
+    fn test_order_local_ips_without_primary_is_sorted_unique() {
+        let ips = order_local_ips(
+            None,
+            vec![
+                "192.168.1.5".to_string(),
+                "10.0.0.1".to_string(),
+                "10.0.0.1".to_string(),
+            ],
+        );
+        assert_eq!(
+            ips,
+            vec!["10.0.0.1".to_string(), "192.168.1.5".to_string()]
+        );
     }
 
 }

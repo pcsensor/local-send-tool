@@ -254,11 +254,17 @@ async fn resolve_destination(to: &str, bind_ip: Option<std::net::Ipv4Addr>) -> S
     listen_handle.abort();
 
     if let Some(peer) = found_peer {
-        if let Some(ip) = peer.ips.first() {
-            format!("{}:{}", ip, peer.port)
-        } else {
-            fallback_address(to)
+        let candidates: Vec<String> = peer
+            .ips
+            .iter()
+            .map(|ip| format!("{}:{}", ip, peer.port))
+            .collect();
+        if candidates.is_empty() {
+            return fallback_address(to);
         }
+        lan_share::client::pick_reachable_address(&candidates, Duration::from_millis(1500))
+            .await
+            .unwrap_or_else(|| fallback_address(to))
     } else {
         fallback_address(to)
     }

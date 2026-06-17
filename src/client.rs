@@ -365,6 +365,34 @@ fn format_url(to_addr: &str, path: &str) -> String {
     format!("{}{}", base, path)
 }
 
+/// Given a peer's advertised addresses (`ip:port` strings), return the first one
+/// that accepts a TCP connection within `timeout`.
+///
+/// A peer may advertise several addresses (e.g. a routable LAN IP plus a
+/// VPN/tunnel address that is unreachable from this machine). Probing lets the
+/// sender skip dead addresses instead of blindly using the first one. If none
+/// respond, the first candidate is returned so the caller still produces a
+/// meaningful connection error.
+pub async fn pick_reachable_address(candidates: &[String], timeout: Duration) -> Option<String> {
+    let first = candidates.first().cloned();
+    for candidate in candidates {
+        let Ok(addrs) = tokio::net::lookup_host(candidate.as_str()).await else {
+            continue;
+        };
+        for addr in addrs {
+            if tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .is_some()
+            {
+                return Some(candidate.clone());
+            }
+        }
+    }
+    first
+}
+
 pub async fn send_text(to_addr: &str, sender_name: &str, text: &str) -> Result<(), reqwest::Error> {
     let url = format_url(to_addr, "/api/message");
     let client = Client::builder()
@@ -770,6 +798,32 @@ mod tests {
     };
     use tempfile::tempdir;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_pick_reachable_address_skips_dead_address() {
+        let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = live_listener.local_addr().unwrap().to_string();
+
+        // Bind then drop to obtain a loopback port that refuses connections fast.
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = dead_listener.local_addr().unwrap().to_string();
+        drop(dead_listener);
+
+        let candidates = vec![dead, live.clone()];
+        let chosen = pick_reachable_address(&candidates, Duration::from_millis(300)).await;
+        assert_eq!(chosen, Some(live));
+    }
+
+    #[tokio::test]
+    async fn test_pick_reachable_address_falls_back_to_first() {
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = dead_listener.local_addr().unwrap().to_string();
+        drop(dead_listener);
+
+        let candidates = vec![dead.clone()];
+        let chosen = pick_reachable_address(&candidates, Duration::from_millis(200)).await;
+        assert_eq!(chosen, Some(dead));
+    }
 
     #[tokio::test]
     async fn test_client_send_text_and_file() {

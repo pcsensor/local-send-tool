@@ -390,7 +390,7 @@ async fn handle_web_message(
     let mut last_error = None;
 
     for peer in targets {
-        let Some(addr) = peer_address(&peer) else {
+        let Some(addr) = peer_address(&peer).await else {
             last_error = Some(format!("节点 '{}' 没有可用地址", peer.name));
             continue;
         };
@@ -468,7 +468,7 @@ async fn handle_web_file(
     let mut last_error = None;
 
     for peer in targets {
-        let Some(addr) = peer_address(&peer) else {
+        let Some(addr) = peer_address(&peer).await else {
             last_error = Some(format!("节点 '{}' 没有可用地址", peer.name));
             continue;
         };
@@ -556,8 +556,16 @@ fn web_sender_name(state: &ServerState) -> String {
         .unwrap_or_else(|| "Web".to_string())
 }
 
-fn peer_address(peer: &Peer) -> Option<String> {
-    peer.ips.first().map(|ip| format!("{}:{}", ip, peer.port))
+async fn peer_address(peer: &Peer) -> Option<String> {
+    let candidates: Vec<String> = peer
+        .ips
+        .iter()
+        .map(|ip| format!("{}:{}", ip, peer.port))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    crate::client::pick_reachable_address(&candidates, std::time::Duration::from_millis(1500)).await
 }
 
 fn web_send_error(status: StatusCode, message: &str) -> axum::response::Response {
