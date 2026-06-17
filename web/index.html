@@ -1185,14 +1185,44 @@
         $("version-info").textContent = `v${info.version || "--"}`;
         $("compress-mode").textContent = info.compress || "auto";
         $("chunked-mode").textContent = info.chunked ? "开启" : "关闭";
-        // Populate config modal defaults
-        $("cfg-download-dir").value = info.download_dir || "";
-        $("cfg-port").value = info.port || 8080;
-        $("cfg-name").value = info.node_name || "";
-        $("cfg-bind-ip").value = info.bind_ip || "";
+        applyConfigValues(runtimeConfigValues(info));
       } catch {
         $("runtime-line").textContent = location.host;
       }
+    }
+
+    function runtimeConfigValues(info) {
+      return {
+        download_dir: info.download_dir,
+        port: info.port,
+        name: info.node_name,
+        bind_ip: info.bind_ip,
+        retry: info.retry,
+        compress: info.compress,
+        chunked: info.chunked,
+        chunk_size: info.chunk_size,
+        chunk_concurrency: info.chunk_concurrency,
+        cancel_timeout: info.cancel_timeout,
+        concurrency: info.concurrency
+      };
+    }
+
+    function valueOrDefault(value, defaultValue) {
+      return value ?? defaultValue;
+    }
+
+    function applyConfigValues(values) {
+      $("cfg-download-dir").value = valueOrDefault(values.download_dir, "");
+      $("cfg-port").value = valueOrDefault(values.port, 8080);
+      $("cfg-name").value = valueOrDefault(values.name, "");
+      $("cfg-bind-ip").value = valueOrDefault(values.bind_ip, "");
+      $("cfg-retry").value = valueOrDefault(values.retry, 0);
+      $("cfg-compress").value = valueOrDefault(values.compress, "auto");
+      $("cfg-chunked").value = valueOrDefault(values.chunked, false) ? "true" : "false";
+      $("cfg-chunk-size").value = valueOrDefault(values.chunk_size, 8388608);
+      $("cfg-chunk-concurrency").value = valueOrDefault(values.chunk_concurrency, 4);
+      $("cfg-cancel-timeout").value = valueOrDefault(values.cancel_timeout, 10);
+      $("cfg-concurrency").value = valueOrDefault(values.concurrency, 3);
     }
 
     async function loadPeers() {
@@ -1210,18 +1240,7 @@
     async function loadConfig() {
       try {
         const config = await fetch("/api/config").then((r) => r.json());
-        const d = config.defaults || {};
-        $("cfg-download-dir").value = d.download_dir || "";
-        $("cfg-port").value = d.port || 8080;
-        $("cfg-name").value = d.name || "";
-        $("cfg-bind-ip").value = d.bind_ip || "";
-        $("cfg-retry").value = d.retry || 0;
-        $("cfg-compress").value = d.compress || "auto";
-        $("cfg-chunked").value = d.chunked ? "true" : "false";
-        $("cfg-chunk-size").value = d.chunk_size || 8388608;
-        $("cfg-chunk-concurrency").value = d.chunk_concurrency || 4;
-        $("cfg-cancel-timeout").value = d.cancel_timeout || 10;
-        $("cfg-concurrency").value = d.concurrency || 3;
+        applyConfigValues(config.defaults || {});
       } catch {
         // use runtime defaults if config endpoint unavailable
       }

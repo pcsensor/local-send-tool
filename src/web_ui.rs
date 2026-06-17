@@ -227,4 +227,58 @@ mod tests {
             "message rendering must not unconditionally scroll to the newest message"
         );
     }
+
+    #[test]
+    fn config_modal_uses_runtime_defaults_for_all_fields() {
+        assert!(
+            INDEX_HTML.contains("function runtimeConfigValues(info)"),
+            "web UI should map runtime info into config form values"
+        );
+        assert!(
+            INDEX_HTML.contains("applyConfigValues(runtimeConfigValues(info))"),
+            "runtime loading should populate the config modal before /api/config is available"
+        );
+        assert!(
+            INDEX_HTML.contains("applyConfigValues(config.defaults || {})"),
+            "local config loading should reuse the same config form mapping"
+        );
+
+        for field in [
+            "download_dir",
+            "port",
+            "node_name",
+            "bind_ip",
+            "retry",
+            "compress",
+            "chunked",
+            "chunk_size",
+            "chunk_concurrency",
+            "cancel_timeout",
+            "concurrency",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("info.{field}")),
+                "runtime config mapping should include {field}"
+            );
+        }
+
+        for input_id in [
+            "cfg-download-dir",
+            "cfg-port",
+            "cfg-name",
+            "cfg-bind-ip",
+            "cfg-retry",
+            "cfg-compress",
+            "cfg-chunked",
+            "cfg-chunk-size",
+            "cfg-chunk-concurrency",
+            "cfg-cancel-timeout",
+            "cfg-concurrency",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("$(\"{input_id}\").value")),
+                "config modal should populate {input_id}"
+            );
+        }
+    }
 }
