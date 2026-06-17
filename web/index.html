@@ -828,6 +828,7 @@
       messageSeq: 0,
       selfName: "arch"
     };
+    const MESSAGE_BOTTOM_THRESHOLD = 64;
 
     const $ = (id) => document.getElementById(id);
 
@@ -941,7 +942,7 @@
               ips: [],
               port: "--"
             };
-          renderAll();
+          renderAll({ messageScroll: "bottom" });
         });
       });
     }
@@ -967,11 +968,11 @@
       $("selected-name").textContent = state.selected ? state.selected.name : "局域网传输群";
     }
 
-    function renderAll() {
+    function renderAll({ messageScroll = "preserve" } = {}) {
       renderChats();
       renderMembers();
       renderHeader();
-      renderMessages();
+      renderMessages({ scroll: messageScroll });
     }
 
     function messageHtml(message) {
@@ -1017,22 +1018,43 @@
       `;
     }
 
-    function renderMessages() {
-      const messages = ensureConversation(currentConversationId());
-      $("messages").innerHTML = messages.map(messageHtml).join("");
-      const last = $("messages").lastElementChild;
-      if (last) last.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    function messageBottomDistance() {
+      const container = $("messages");
+      return container.scrollHeight - container.scrollTop - container.clientHeight;
     }
 
-    function appendConversationMessage(conversationId, message) {
+    function isMessageListNearBottom() {
+      return messageBottomDistance() <= MESSAGE_BOTTOM_THRESHOLD;
+    }
+
+    function renderMessages({ scroll = "preserve" } = {}) {
+      const container = $("messages");
+      const messages = ensureConversation(currentConversationId());
+      const previousScrollTop = container.scrollTop;
+      const shouldScrollToBottom =
+        scroll === "bottom" || (scroll === "auto" && isMessageListNearBottom());
+
+      container.innerHTML = messages.map(messageHtml).join("");
+
+      if (shouldScrollToBottom) {
+        container.scrollTop = container.scrollHeight;
+      } else if (scroll === "preserve") {
+        container.scrollTop = previousScrollTop;
+      }
+    }
+
+    function appendConversationMessage(conversationId, message, { scroll = "auto" } = {}) {
+      const isActiveConversation = conversationId === currentConversationId();
+      const shouldScrollToBottom =
+        scroll === "bottom" || (scroll === "auto" && isMessageListNearBottom());
       const entry = {
         id: nextMessageId(),
         time: shortTime(),
         ...message
       };
       ensureConversation(conversationId).push(entry);
-      if (conversationId === currentConversationId()) {
-        renderMessages();
+      if (isActiveConversation) {
+        renderMessages({ scroll: shouldScrollToBottom ? "bottom" : "preserve" });
       }
       renderChats();
       return entry.id;
@@ -1044,7 +1066,7 @@
         direction: "out",
         sender: state.selfName,
         text
-      });
+      }, { scroll: "bottom" });
     }
 
     function addSystemMessage(text) {
@@ -1073,10 +1095,12 @@
       for (const [conversationId, messages] of Object.entries(state.conversations)) {
         const message = messages.find((item) => item.id === messageId);
         if (!message) continue;
+        const isActiveConversation = conversationId === currentConversationId();
+        const shouldScrollToBottom = isActiveConversation && isMessageListNearBottom();
         message.progress = progress;
         message.status = progress >= 100 ? "已完成" : "上传中";
-        if (conversationId === currentConversationId()) {
-          renderMessages();
+        if (isActiveConversation) {
+          renderMessages({ scroll: shouldScrollToBottom ? "bottom" : "preserve" });
         }
         renderChats();
         return;

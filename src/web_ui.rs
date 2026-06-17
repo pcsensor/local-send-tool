@@ -187,7 +187,7 @@ mod tests {
             "web UI should derive a stable conversation id from the selected chat"
         );
         assert!(
-            INDEX_HTML.contains("function renderMessages()"),
+            INDEX_HTML.contains("function renderMessages({ scroll = \"preserve\" } = {})"),
             "switching chats should render only the selected conversation history"
         );
         assert!(
@@ -197,6 +197,34 @@ mod tests {
         assert!(
             INDEX_HTML.contains("conversationIdForSender"),
             "received messages should be routed to the sender's private conversation"
+        );
+    }
+
+    #[test]
+    fn web_chat_preserves_manual_message_scroll() {
+        assert!(
+            INDEX_HTML.contains("const MESSAGE_BOTTOM_THRESHOLD"),
+            "web UI should define a near-bottom threshold for sticky scrolling"
+        );
+        assert!(
+            INDEX_HTML.contains("function renderAll({ messageScroll = \"preserve\" } = {})"),
+            "regular UI refreshes should preserve the current message scroll"
+        );
+        assert!(
+            INDEX_HTML.contains("renderMessages({ scroll: messageScroll })"),
+            "renderAll should pass the selected scroll mode into message rendering"
+        );
+        assert!(
+            INDEX_HTML.contains("container.scrollTop = previousScrollTop"),
+            "preserve mode should keep the user's current history position"
+        );
+        assert!(
+            INDEX_HTML.contains("renderAll({ messageScroll: \"bottom\" })"),
+            "explicit chat switches should still open at the latest message"
+        );
+        assert!(
+            !INDEX_HTML.contains("scrollIntoView"),
+            "message rendering must not unconditionally scroll to the newest message"
         );
     }
 }
