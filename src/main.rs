@@ -710,6 +710,11 @@ async fn main() {
                 }
             });
 
+            let send_settings = lan_share::config::resolve_send_settings(
+                lan_share::config::ConfigOverrides::default(),
+                &env_config,
+                &app_config,
+            );
             let web_info = lan_share::web_ui::WebRuntimeInfo {
                 node_name: node_name.clone(),
                 port: actual_port,
@@ -717,13 +722,13 @@ async fn main() {
                 download_dir: settings.download_dir.display().to_string(),
                 version: env!("CARGO_PKG_VERSION"),
                 ui_stack: "Rust Axum + embedded Web UI",
-                compress: app_config.defaults.compress,
-                retry: app_config.defaults.retry,
-                chunked: app_config.defaults.chunked,
-                chunk_size: app_config.defaults.chunk_size,
-                chunk_concurrency: app_config.defaults.chunk_concurrency,
-                cancel_timeout: app_config.defaults.cancel_timeout,
-                concurrency: app_config.defaults.concurrency,
+                compress: Some(send_settings.compression),
+                retry: Some(send_settings.retry_attempts),
+                chunked: Some(send_settings.chunked),
+                chunk_size: Some(send_settings.chunk_size),
+                chunk_concurrency: Some(send_settings.chunk_concurrency),
+                cancel_timeout: Some(send_settings.cancel_timeout),
+                concurrency: Some(send_settings.concurrency),
             };
             let (sse_tx, _) = tokio::sync::broadcast::channel::<String>(64);
             let app = lan_share::server::make_router_with_events_and_info(

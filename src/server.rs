@@ -30,6 +30,8 @@ use tokio::sync::broadcast::Sender as BroadcastSender;
 use tokio::sync::{Mutex, Notify};
 use tokio_util::io::StreamReader;
 
+const WEB_TOKEN_HEADER: &str = "x-lan-share-web-token";
+
 /// Reject control-plane requests that do not originate from the local machine.
 /// Receiving endpoints stay open to the LAN; config endpoints must only be
 /// driven from localhost.
@@ -48,6 +50,7 @@ async fn require_localhost(
 /// served by this node. This lets a LAN browser use the Web UI without opening
 /// config mutation endpoints to the network.
 async fn require_web_ui_request(
+    State(state): State<ServerState>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -56,13 +59,26 @@ async fn require_web_ui_request(
         connect_info,
         Some(ConnectInfo(addr)) if addr.ip().is_loopback()
     );
-    let is_same_origin = request_has_same_origin(&request);
+    let is_valid_web_request = request_has_valid_web_token(&request, state.web_token.as_deref())
+        && request_has_same_origin(&request);
 
-    if is_loopback || is_same_origin {
+    if is_loopback || is_valid_web_request {
         next.run(request).await
     } else {
         web_send_error(StatusCode::FORBIDDEN, "Web 接口只接受本机或同源页面请求")
     }
+}
+
+fn request_has_valid_web_token(request: &axum::extract::Request, expected: Option<&str>) -> bool {
+    let Some(expected) = expected.filter(|token| !token.is_empty()) else {
+        return false;
+    };
+    request
+        .headers()
+        .get(WEB_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|token| token == expected)
+        .unwrap_or(false)
 }
 
 fn request_has_same_origin(request: &axum::extract::Request) -> bool {
@@ -125,6 +141,7 @@ pub struct ServerState {
     pub download_dir: PathBuf,
     upload_sessions: UploadSessions,
     web_info: Option<WebRuntimeInfo>,
+    web_token: Option<String>,
     sse_tx: Option<BroadcastSender<String>>,
 }
 
@@ -192,7 +209,7 @@ struct InitUploadResponse {
 }
 
 pub fn make_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
-    make_router_with_events_and_info(registry, download_dir, None, None)
+    make_router_with_events_info_and_token(registry, download_dir, None, None, None)
 }
 
 pub fn make_router_with_events_and_info(
@@ -201,11 +218,23 @@ pub fn make_router_with_events_and_info(
     web_info: Option<WebRuntimeInfo>,
     sse_tx: Option<BroadcastSender<String>>,
 ) -> Router {
+    let web_token = web_info.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+    make_router_with_events_info_and_token(registry, download_dir, web_info, sse_tx, web_token)
+}
+
+pub fn make_router_with_events_info_and_token(
+    registry: PeerRegistry,
+    download_dir: PathBuf,
+    web_info: Option<WebRuntimeInfo>,
+    sse_tx: Option<BroadcastSender<String>>,
+    web_token: Option<String>,
+) -> Router {
     let state = ServerState {
         registry,
         download_dir,
         upload_sessions: Arc::new(Mutex::new(HashMap::new())),
         web_info,
+        web_token,
         sse_tx,
     };
 
@@ -240,11 +269,14 @@ pub fn make_router_with_events_and_info(
             "/api/web/file",
             post(handle_web_file).layer(DefaultBodyLimit::max(max_file_limit)),
         )
-        .route_layer(axum::middleware::from_fn(require_web_ui_request));
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_web_ui_request,
+        ));
 
     Router::new()
-        .route("/", get(web_ui::index))
-        .route("/app", get(web_ui::index))
+        .route("/", get(handle_index))
+        .route("/app", get(handle_index))
         .route("/api/peers", get(handle_peers))
         .route("/api/events", get(handle_sse_events))
         .merge(local_control_plane)
@@ -276,6 +308,10 @@ pub fn make_router_with_events_and_info(
             delete(handle_file_cancel).layer(DefaultBodyLimit::max(1024 * 1024)),
         )
         .with_state(state)
+}
+
+async fn handle_index(State(state): State<ServerState>) -> impl IntoResponse {
+    axum::response::Html(web_ui::index_html_with_token(state.web_token.as_deref())).into_response()
 }
 
 async fn handle_peers(State(state): State<ServerState>) -> Json<Vec<crate::peer::Peer>> {
@@ -539,10 +575,7 @@ async fn handle_web_file(
         }
     };
     let sender = web_sender_name(&state);
-    let options = FileSendOptions {
-        progress: ProgressMode::None,
-        ..FileSendOptions::default()
-    };
+    let options = web_file_options(&state);
     let mut delivered = 0usize;
     let mut last_error = None;
 
@@ -575,6 +608,36 @@ async fn handle_web_file(
         }),
     )
         .into_response()
+}
+
+fn web_file_options(state: &ServerState) -> FileSendOptions {
+    let mut options = FileSendOptions {
+        progress: ProgressMode::None,
+        ..FileSendOptions::default()
+    };
+
+    if let Some(info) = &state.web_info {
+        if let Some(retry) = info.retry {
+            options.retry_attempts = retry;
+        }
+        if let Some(compress) = info.compress {
+            options.compression = compress;
+        }
+        if let Some(cancel_timeout) = info.cancel_timeout {
+            options.cancel_timeout = std::time::Duration::from_secs(cancel_timeout);
+        }
+        if let Some(chunked) = info.chunked {
+            options.use_chunked = chunked;
+        }
+        if let Some(chunk_size) = info.chunk_size {
+            options.chunk_size = chunk_size;
+        }
+        if let Some(chunk_concurrency) = info.chunk_concurrency {
+            options.chunk_concurrency = chunk_concurrency;
+        }
+    }
+
+    options
 }
 
 async fn save_web_file_field(mut field: Field<'_>) -> Result<PathBuf, String> {
@@ -1504,7 +1567,40 @@ mod tests {
         request
     }
 
-    fn web_message_request(remote: Option<&str>, origin: Option<&str>) -> Request<Body> {
+    fn test_web_info() -> WebRuntimeInfo {
+        WebRuntimeInfo {
+            node_name: "web-test".to_string(),
+            port: 8080,
+            bind_ip: Some("192.168.1.10".to_string()),
+            download_dir: "/tmp".to_string(),
+            version: "test",
+            ui_stack: "test",
+            compress: Some(crate::client::CompressionMode::Always),
+            retry: Some(2),
+            chunked: Some(true),
+            chunk_size: Some(4096),
+            chunk_concurrency: Some(3),
+            cancel_timeout: Some(5),
+            concurrency: Some(4),
+        }
+    }
+
+    fn web_router(registry: PeerRegistry, download_dir: PathBuf) -> Router {
+        make_router_with_events_info_and_token(
+            registry,
+            download_dir,
+            Some(test_web_info()),
+            None,
+            Some("test-web-token".to_string()),
+        )
+    }
+
+    fn web_message_request(
+        remote: Option<&str>,
+        origin: Option<&str>,
+        token: Option<&str>,
+        fetch_site: Option<&str>,
+    ) -> Request<Body> {
         let mut builder = Request::builder()
             .method("POST")
             .uri("/api/web/message")
@@ -1512,6 +1608,12 @@ mod tests {
             .header("host", "192.168.1.10:8080");
         if let Some(origin) = origin {
             builder = builder.header("origin", origin);
+        }
+        if let Some(token) = token {
+            builder = builder.header(WEB_TOKEN_HEADER, token);
+        }
+        if let Some(fetch_site) = fetch_site {
+            builder = builder.header("sec-fetch-site", fetch_site);
         }
         let mut request = builder
             .body(Body::from(r#"{"target":"","text":"hello"}"#))
@@ -1549,10 +1651,14 @@ mod tests {
     async fn test_web_message_allows_same_origin_remote_address() {
         let registry = PeerRegistry::new();
         let tmp_dir = tempdir().unwrap();
-        let router = make_router(registry, tmp_dir.path().to_path_buf());
+        let router = web_router(registry, tmp_dir.path().to_path_buf());
 
-        let request =
-            web_message_request(Some("192.168.1.50:54321"), Some("http://192.168.1.10:8080"));
+        let request = web_message_request(
+            Some("192.168.1.50:54321"),
+            Some("http://192.168.1.10:8080"),
+            Some("test-web-token"),
+            None,
+        );
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
@@ -1561,11 +1667,48 @@ mod tests {
     async fn test_web_message_rejects_remote_without_same_origin() {
         let registry = PeerRegistry::new();
         let tmp_dir = tempdir().unwrap();
-        let router = make_router(registry, tmp_dir.path().to_path_buf());
+        let router = web_router(registry, tmp_dir.path().to_path_buf());
 
-        let request = web_message_request(Some("192.168.1.50:54321"), None);
+        let request = web_message_request(
+            Some("192.168.1.50:54321"),
+            None,
+            Some("test-web-token"),
+            None,
+        );
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_web_message_rejects_forged_fetch_metadata_without_token() {
+        let registry = PeerRegistry::new();
+        let tmp_dir = tempdir().unwrap();
+        let router = web_router(registry, tmp_dir.path().to_path_buf());
+
+        let request =
+            web_message_request(Some("192.168.1.50:54321"), None, None, Some("same-origin"));
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_web_file_options_use_runtime_transfer_settings() {
+        let state = ServerState {
+            registry: PeerRegistry::new(),
+            download_dir: PathBuf::from("/tmp"),
+            upload_sessions: Arc::new(Mutex::new(HashMap::new())),
+            web_info: Some(test_web_info()),
+            web_token: Some("test-web-token".to_string()),
+            sse_tx: None,
+        };
+
+        let options = web_file_options(&state);
+        assert_eq!(options.retry_attempts, 2);
+        assert_eq!(options.compression, crate::client::CompressionMode::Always);
+        assert!(options.use_chunked);
+        assert_eq!(options.chunk_size, 4096);
+        assert_eq!(options.chunk_concurrency, 3);
+        assert_eq!(options.cancel_timeout, std::time::Duration::from_secs(5));
     }
 
     #[tokio::test]
@@ -2045,6 +2188,7 @@ mod tests {
             download_dir: tmp_dir.path().to_path_buf(),
             upload_sessions: upload_sessions.clone(),
             web_info: None,
+            web_token: None,
             sse_tx: None,
         };
 
@@ -2396,6 +2540,7 @@ mod tests {
             download_dir: download_dir.clone(),
             upload_sessions: sessions.clone(),
             web_info: None,
+            web_token: None,
             sse_tx: None,
         };
 
@@ -2490,6 +2635,7 @@ mod tests {
             download_dir: download_dir.clone(),
             upload_sessions: sessions_safe.clone(),
             web_info: None,
+            web_token: None,
             sse_tx: None,
         };
 

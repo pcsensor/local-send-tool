@@ -826,9 +826,11 @@
         ]
       },
       messageSeq: 0,
-      selfName: "arch"
+      selfName: "arch",
+      configDefaults: {}
     };
     const MESSAGE_BOTTOM_THRESHOLD = 64;
+    const WEB_API_TOKEN = "__LAN_SHARE_WEB_TOKEN__";
 
     const $ = (id) => document.getElementById(id);
 
@@ -1114,7 +1116,7 @@
     async function sendTextMessage(text) {
       const response = await fetch("/api/web/message", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: webApiHeaders({ "content-type": "application/json" }),
         body: JSON.stringify({ target: selectedTarget(), text })
       });
       const result = await response.json().catch(() => ({ message: "发送失败" }));
@@ -1159,8 +1161,19 @@
         xhr.addEventListener("abort", () => reject(new Error("已取消")));
 
         xhr.open("POST", "/api/web/file");
+        if (WEB_API_TOKEN) {
+          xhr.setRequestHeader("x-lan-share-web-token", WEB_API_TOKEN);
+        }
         xhr.send(form);
       });
+    }
+
+    function webApiHeaders(headers = {}) {
+      const result = { ...headers };
+      if (WEB_API_TOKEN) {
+        result["x-lan-share-web-token"] = WEB_API_TOKEN;
+      }
+      return result;
     }
 
     function escapeHtml(value) {
@@ -1174,7 +1187,9 @@
 
     async function loadRuntime() {
       try {
-        const info = await fetch("/api/runtime").then((response) => response.json());
+        const info = await fetch("/api/runtime", {
+          headers: webApiHeaders()
+        }).then((response) => response.json());
         state.selfName = info.node_name || state.selfName;
         $("runtime-line").textContent = `${info.node_name} / ${location.host}`;
         $("metric-node").textContent = info.node_name;
@@ -1239,28 +1254,55 @@
 
     async function loadConfig() {
       try {
-        const config = await fetch("/api/config").then((r) => r.json());
-        applyConfigValues(config.defaults || {});
+        const response = await fetch("/api/config");
+        if (!response.ok) {
+          throw new Error(response.statusText || "配置接口不可用");
+        }
+        const config = await response.json();
+        state.configDefaults = { ...(config.defaults || {}) };
+        applyConfigValues(state.configDefaults);
+        return true;
       } catch {
-        // use runtime defaults if config endpoint unavailable
+        return false;
       }
     }
 
+    function optionalTextValue(id) {
+      const value = $(id).value.trim();
+      return value === "" ? null : value;
+    }
+
+    function optionalIntegerValue(id) {
+      const value = $(id).value.trim();
+      return value === "" ? null : parseInt(value, 10);
+    }
+
+    function setConfigSaveAvailable(canSave) {
+      $("save-config").disabled = !canSave;
+      $("save-config").style.opacity = canSave ? "1" : "0.55";
+      $("save-config").style.cursor = canSave ? "pointer" : "not-allowed";
+    }
+
     async function saveConfig() {
+      if ($("save-config").disabled) {
+        $("config-status").textContent = "当前访问无法保存配置，请在本机打开 Web UI 后修改。";
+        $("config-status").style.color = "var(--muted)";
+        return;
+      }
       const config = {
         defaults: {
-          download_dir: $("cfg-download-dir").value || null,
-          port: parseInt($("cfg-port").value) || null,
-          name: $("cfg-name").value || null,
-          bind_ip: $("cfg-bind-ip").value || null,
-          retry: parseInt($("cfg-retry").value) || null,
+          ...state.configDefaults,
+          download_dir: optionalTextValue("cfg-download-dir"),
+          port: optionalIntegerValue("cfg-port"),
+          name: optionalTextValue("cfg-name"),
+          bind_ip: optionalTextValue("cfg-bind-ip"),
+          retry: optionalIntegerValue("cfg-retry"),
           compress: $("cfg-compress").value || "auto",
           chunked: $("cfg-chunked").value === "true",
-          chunk_size: parseInt($("cfg-chunk-size").value) || null,
-          chunk_concurrency: parseInt($("cfg-chunk-concurrency").value) || null,
-          cancel_timeout: parseInt($("cfg-cancel-timeout").value) || null,
-          concurrency: parseInt($("cfg-concurrency").value) || null,
-          progress: true,
+          chunk_size: optionalIntegerValue("cfg-chunk-size"),
+          chunk_concurrency: optionalIntegerValue("cfg-chunk-concurrency"),
+          cancel_timeout: optionalIntegerValue("cfg-cancel-timeout"),
+          concurrency: optionalIntegerValue("cfg-concurrency")
         }
       };
       // Remove null/empty values
@@ -1281,8 +1323,10 @@
           $("config-status").style.color = "var(--danger)";
           return;
         }
+        const result = await response.json().catch(() => ({}));
         $("config-status").textContent = "配置已保存 (重启后生效)";
         $("config-status").style.color = "var(--green)";
+        state.configDefaults = { ...(result.defaults || config.defaults) };
         addSystemMessage("配置已保存到 ~/.config/lan-share/config.toml，部分设置需重启服务生效。");
       } catch (error) {
         $("config-status").textContent = `保存失败: ${error.message}`;
@@ -1345,9 +1389,13 @@
 
       // Config modal bindings
       $("open-config").addEventListener("click", async () => {
-        await loadConfig();
+        const canSave = await loadConfig();
+        setConfigSaveAvailable(canSave);
         $("config-modal").style.display = "block";
-        $("config-status").textContent = "";
+        $("config-status").textContent = canSave
+          ? ""
+          : "当前访问无法保存配置，请在本机打开 Web UI 后修改。";
+        $("config-status").style.color = "var(--muted)";
       });
       $("close-config").addEventListener("click", () => {
         $("config-modal").style.display = "none";

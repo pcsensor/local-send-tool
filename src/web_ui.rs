@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::convert::Infallible;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
+const WEB_TOKEN_PLACEHOLDER: &str = "__LAN_SHARE_WEB_TOKEN__";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WebRuntimeInfo {
@@ -70,8 +71,12 @@ impl SseMessage {
     }
 }
 
-pub async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+pub async fn index() -> Html<String> {
+    Html(index_html_with_token(None))
+}
+
+pub fn index_html_with_token(web_token: Option<&str>) -> String {
+    INDEX_HTML.replace(WEB_TOKEN_PLACEHOLDER, web_token.unwrap_or(""))
 }
 
 pub async fn runtime_info(info: WebRuntimeInfo) -> Json<WebRuntimeInfo> {
@@ -239,7 +244,7 @@ mod tests {
             "runtime loading should populate the config modal before /api/config is available"
         );
         assert!(
-            INDEX_HTML.contains("applyConfigValues(config.defaults || {})"),
+            INDEX_HTML.contains("applyConfigValues(state.configDefaults)"),
             "local config loading should reuse the same config form mapping"
         );
 
@@ -280,5 +285,65 @@ mod tests {
                 "config modal should populate {input_id}"
             );
         }
+    }
+
+    #[test]
+    fn web_api_requests_include_runtime_token() {
+        assert!(
+            INDEX_HTML.contains("const WEB_API_TOKEN = \"__LAN_SHARE_WEB_TOKEN__\""),
+            "web UI should receive a server-generated API token"
+        );
+        assert!(
+            INDEX_HTML.contains("function webApiHeaders(headers = {})"),
+            "web UI should centralize protected Web API headers"
+        );
+        assert!(
+            INDEX_HTML.contains("result[\"x-lan-share-web-token\"] = WEB_API_TOKEN"),
+            "protected Web API calls should include the token header"
+        );
+        assert!(
+            INDEX_HTML
+                .contains("headers: webApiHeaders({ \"content-type\": \"application/json\" })"),
+            "message sends should use protected Web API headers"
+        );
+        assert!(
+            INDEX_HTML.contains("xhr.setRequestHeader(\"x-lan-share-web-token\", WEB_API_TOKEN)"),
+            "file sends should use protected Web API headers"
+        );
+    }
+
+    #[test]
+    fn rendered_index_replaces_web_api_token_placeholder() {
+        let html = super::index_html_with_token(Some("token-123"));
+        assert!(html.contains("const WEB_API_TOKEN = \"token-123\""));
+        assert!(!html.contains("__LAN_SHARE_WEB_TOKEN__"));
+    }
+
+    #[test]
+    fn config_modal_preserves_unedited_defaults_and_marks_remote_readonly() {
+        assert!(
+            INDEX_HTML.contains("configDefaults: {}"),
+            "web UI should keep the loaded config defaults while editing"
+        );
+        assert!(
+            INDEX_HTML.contains("...state.configDefaults"),
+            "saving should preserve config fields that are not shown in the modal"
+        );
+        assert!(
+            INDEX_HTML.contains("function optionalIntegerValue(id)"),
+            "numeric config parsing should preserve valid zero values instead of using || null"
+        );
+        assert!(
+            !INDEX_HTML.contains("progress: true"),
+            "saving from the modal must not force progress=true when progress is not editable"
+        );
+        assert!(
+            INDEX_HTML.contains("setConfigSaveAvailable(canSave)"),
+            "remote config views should disable saving when /api/config is unavailable"
+        );
+        assert!(
+            INDEX_HTML.contains("当前访问无法保存配置，请在本机打开 Web UI 后修改。"),
+            "remote config views should explain why saving is unavailable"
+        );
     }
 }
