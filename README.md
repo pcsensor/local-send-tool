@@ -1,175 +1,265 @@
-# lan-share 局域网文件传输助手
+# lan-share
 
-`lan-share` 是一个用 Rust 编写的高性能、跨平台（macOS、Windows、Linux）局域网命令行文字与大文件传输工具。它无需任何第三方服务器中转，支持自动服务发现，专为追求极速和安全性的终端用户设计。
+`lan-share` 是一个基于 Rust 的局域网文本与文件传输工具。它通过 UDP 组播发现局域网节点，通过 HTTP 接收文本、普通文件流和分片文件上传，不依赖第三方中转服务。
 
----
+项目同时提供命令行模式和内置 Web UI。命令行适合脚本、终端工作流和大文件传输；Web UI 适合在浏览器中查看节点、发送消息和拖拽文件。
 
-## 🌟 核心特性
+## 功能概览
 
-- **服务自动发现**：基于 UDP 组播协议（多播地址 `224.0.0.188:50001`）实现，节点上线后自动广播，无需手动输入对方 IP。
-- **高性能流式文件传输**：服务端使用 Axum 异步接收文件并以 $O(1)$ 常数内存占用逐步流式写入磁盘，支持百兆、千兆网络满速传输。
-- **进度、重试与完整性校验**：发送端支持进度条、速度/ETA、指数退避重试；接收端使用 SHA-256 校验并在失败时清理临时文件。
-- **分片并行与断点续传**：可通过 `--chunked` 启用多连接分片上传，并使用 `--resume-upload-id` 继续未完成的分片传输。
-- **高安全性保障**：
-  - **配置控制面仅限本机**：配置读写接口（`/api/config`）只接受来自 localhost 的请求，局域网其他设备无法远程改写本机配置。Web 页面发送接口（`/api/web/message`、`/api/web/file`）允许本机或同源 Web 页面请求，便于通过局域网地址打开 Web UI 后发送文字和文件；接收类接口（`/api/message`、`/api/file/*`）仍对局域网开放以便正常收件。
-  - **路径穿越防御**：严格净化接收文件名（只保留 Basename），防止恶意文件覆盖系统敏感文件。
-  - **并发写安全**：采用内核级原子创建操作 `create_new`，在多用户高并发上传同名文件时，自动检测冲突并进行重名递增（例如 `file_1.txt`），无数据被覆盖风险。
-- **跨平台多实例调试**：针对 macOS、Linux 以及 Windows 的底层端口复用差异进行适配，完美支持在单机上启动多个实例用于开发测试。
+- 局域网自动发现：UDP 组播地址 `224.0.0.188:50001`。
+- 文本发送：支持按节点名、UUID、IP、`IP:Port` 或 IPv6 目标发送。
+- 文件发送：支持普通流式上传、SHA-256 校验、失败清理和重名避让。
+- 分片上传：支持多连接分片上传、并发控制和按 upload id 续传。
+- 批量发送：`send-files` 可并发发送多个本地文件。
+- 传输选项：支持重试、zstd 压缩、进度条、取消清理等待时间。
+- Web UI：提供节点列表、聊天式消息视图、文件发送、配置查看和本机配置保存。
+- 网卡绑定：支持 `--bind-ip`，适用于 TUN 代理、多网卡和组播路由异常场景。
 
----
+## 安装
 
-## 🚀 编译与安装
-
-在开始之前，请确保您的系统已安装 Rust 工具链。
+需要 Rust 工具链。
 
 ```bash
-# 克隆仓库并进入目录后编译
 cargo build --release
 ```
 
-编译产物位于 `target/release/lan-share`。您可以将该可执行文件复制到系统的 `PATH` 路径下（如 `/usr/local/bin`）以方便全局调用。
+编译产物位于：
 
----
-
-## 💻 所有使用方法
-
-### 1. 启动服务（接收端）
-使用 `serve` 命令启动本地监听。
-
-```bash
-lan-share serve [FLAGS]
-```
-
-**支持参数：**
-*   `--dir <DIR>`：指定接收文件的保存目录。默认值为当前目录下的 `./downloads`。
-*   `-p`, `--port <PORT>`：指定绑定的 TCP 端口。默认值为 `8080`。**若端口已被占用，程序会自动递增尝试下一个可用端口**（如 8081, 8082...）。
-*   `-n`, `--name <NAME>`：为本地节点设置一个局域网别名（Alias）。默认使用系统主机名。
-*   `--bind-ip <IP>`：指定局域网网卡 IP（开启 TUN 网络代理，如 Clash/Sing-box 的 TUN 模式时，建议绑定实际的局域网 IP，例如 `192.168.1.5`）。
-
-**示例：**
-```bash
-# 使用默认配置启动
-lan-share serve
-
-# 启动并设置别名为 "archlinux"，文件保存到 ~/Downloads/LAN-Share，从 9000 端口开始尝试绑定
-lan-share serve --name archlinux --dir ~/Downloads/LAN-Share --port 9000
-```
-
----
-
-### 2. 扫描局域网节点
-使用 `peers` 命令扫描当前局域网中运行着 `lan-share serve` 的所有活动设备。
-
-```bash
-lan-share peers [FLAGS]
-```
-
-**支持参数：**
-*   `--bind-ip <IP>`：指定局域网网卡 IP（开启 TUN 网络代理时使用，例如 `192.168.1.5`）。
-
-**示例输出：**
 ```text
-Scanning local network for peers (listening for 1.5 seconds)...
-UUID                                 | Name                 | Port  | IPs
---------------------------------------------------------------------------------
-fb741f93-6856-4a75-a760-4f723fefccb2 | archlinux            | 8080  | 192.168.100.155
-9ea6338f-c990-495e-83b3-74d958be324e | win11-laptop         | 8081  | 192.168.100.102
+target/release/lan-share
 ```
 
----
-
-### 3. 发送文字消息
-使用 `send-text` 命令向局域网节点发送简短消息。
+可以将它放入 `PATH`，例如：
 
 ```bash
-lan-share send-text --to <TARGET> [FLAGS] <TEXT>
+cp target/release/lan-share /usr/local/bin/lan-share
 ```
 
-**支持参数：**
-*   `--to <TARGET>`（必需）：指定接收端目标。可以是**节点别名**（如 `archlinux`）、**UUID**、**IP 地址**、**IP:Port** 或 **IPv6**。
-*   `-n`, `--name <SENDER_NAME>`：指定您的发送者署名。默认使用系统主机名。
-*   `--bind-ip <IP>`：指定局域网网卡 IP（开启 TUN 网络代理时使用，例如 `192.168.1.5`）。
-*   `<TEXT>`（位置参数）：要发送的文字消息内容，如有空格需用引号包裹。
-
-**示例：**
-```bash
-# 发送给别名为 archlinux 的节点
-lan-share send-text --to archlinux "Hello from macOS"
-
-# 发送给直连 IP 且指定发送人名称为 Alice
-lan-share send-text --to 192.168.100.155:8080 --name Alice "这是文字测试"
-```
-
----
-
-### 4. 发送本地文件
-使用 `send-file` 命令传输本地文件。
+开发时也可以直接使用：
 
 ```bash
-lan-share send-file --to <TARGET> [FLAGS] <FILE_PATH>
+cargo run -- <COMMAND>
 ```
 
-**支持参数：**
-*   `--to <TARGET>`（必需）：指定接收端目标。可以是**节点别名**、**UUID**、**IP 地址**、**IP:Port** 或 **IPv6**。
-*   `-n`, `--name <SENDER_NAME>`：指定您的发送者署名。默认使用系统主机名。
-*   `--bind-ip <IP>`：指定局域网网卡 IP（开启 TUN 网络代理时使用，例如 `192.168.1.5`）。
-*   `--retry <N>`：发送失败时最多重试 N 次。
-*   `--compress <auto|always|never>`：是否使用 zstd 压缩文件流，默认 `auto`。
-*   `--progress`：显示上传进度、速度和 ETA。
-*   `--chunked`：启用分片多连接上传。
-*   `--chunk-size <BYTES>`：分片大小，默认 `8388608`（8 MiB）。
-*   `--chunk-concurrency <N>`：分片并发连接数，默认 `4`。
-*   `--resume-upload-id <ID>`：继续指定 upload id 的未完成分片上传。
-*   `--cancel-timeout <SECONDS>`：收到 Ctrl+C 后等待接收端清理的提示超时时间，默认 `10`。
-*   `<FILE_PATH>`（位置参数）：本地要发送的文件路径。
+## 快速开始
 
-**示例：**
-```bash
-# 发送本地 pdf 准考证文件给 archlinux 节点
-lan-share send-file --to archlinux ~/Downloads/ticket.pdf
-
-# 使用直连 IP 传输 zip 压缩包
-lan-share send-file --to 192.168.100.155:8080 ./archive.zip
-
-# 显示进度并在失败时重试 3 次
-lan-share send-file --to archlinux --progress --retry 3 ./large.log
-
-# 启用分片多连接上传；如果中断，可保留输出中的 upload id 后续续传
-lan-share send-file --to archlinux --chunked --chunk-concurrency 4 ./movie.mkv
-```
-
----
-
-### 5. 批量发送多个文件
-使用 `send-files` 命令一次发送多个文件，默认最多 3 个文件并发上传。
+在接收端启动服务：
 
 ```bash
-lan-share send-files --to <TARGET> [FLAGS] <FILE_PATH>...
+lan-share serve --name macbook --dir ~/Downloads/LAN-Share
 ```
 
-**支持参数：**
-*   `--to <TARGET>`（必需）：指定接收端目标。
-*   `-n`, `--name <SENDER_NAME>`：指定您的发送者署名。
-*   `--bind-ip <IP>`：指定局域网网卡 IP。
-*   `--concurrency <N>`：同时发送的文件数，默认 `3`。
-*   `--retry <N>`：每个文件失败时最多重试 N 次。
-*   `--compress <auto|always|never>`：是否使用 zstd 压缩文件流，默认 `auto`。
-*   `--progress`：显示上传进度、速度和 ETA。
-*   `--chunked`：为每个文件启用分片多连接上传。
-*   `--chunk-size <BYTES>`：分片大小，默认 `8388608`（8 MiB）。
-*   `--chunk-concurrency <N>`：每个文件的分片并发连接数，默认 `4`。
+在另一台设备扫描节点：
 
-**示例：**
 ```bash
-lan-share send-files --to archlinux --concurrency 2 ./a.zip ./b.zip ./c.zip
+lan-share peers
 ```
 
----
+发送文本：
 
-### 6. 配置文件与环境变量
-配置优先级为：CLI 参数 > 环境变量 > 配置文件 > 默认值。
+```bash
+lan-share send-text --to macbook "hello from another machine"
+```
 
-配置文件路径固定为 `~/.config/lan-share/config.toml`，不随操作系统切换到其他标准配置目录。示例：
+发送文件：
+
+```bash
+lan-share send-file --to macbook ~/Downloads/archive.zip
+```
+
+启动 Web UI：
+
+```bash
+lan-share web --name macbook --dir ~/Downloads/LAN-Share
+```
+
+命令会打印可访问地址，例如：
+
+```text
+Web 界面: http://192.168.1.5:8080
+```
+
+## 命令参考
+
+### `serve`
+
+启动接收服务，开放文本和文件接收接口。
+
+```bash
+lan-share serve [OPTIONS]
+```
+
+常用选项：
+
+- `--dir <DIR>`：接收文件保存目录，默认 `./downloads`。
+- `-p, --port <PORT>`：HTTP 监听端口，默认 `8080`；端口占用时自动递增。
+- `-n, --name <NAME>`：当前节点名称，默认使用系统主机名。
+- `--bind-ip <IP>`：绑定指定 IPv4 网卡地址。
+
+示例：
+
+```bash
+lan-share serve --name linux-box --dir ~/Downloads/LAN-Share --port 9000
+```
+
+### `web`
+
+启动接收服务和内置 Web UI。
+
+```bash
+lan-share web [OPTIONS]
+```
+
+选项与 `serve` 相同：
+
+- `--dir <DIR>`
+- `-p, --port <PORT>`
+- `-n, --name <NAME>`
+- `--bind-ip <IP>`
+
+Web UI 支持：
+
+- 查看在线节点。
+- 按群组或单个节点发送文字。
+- 上传并发送文件。
+- 显示当前有效运行配置。
+- 通过 loopback 本机访问时保存配置到 `~/.config/lan-share/config.toml`。
+
+远程浏览器可以查看配置值，但配置保存接口只接受 TCP 来源为 loopback 的请求。也就是说，只有服务监听 loopback 且通过 `127.0.0.1` 或 `localhost` 打开时才能在页面内保存配置；通过局域网地址打开时配置弹窗为只读，保存按钮会被禁用。
+
+### `peers`
+
+扫描局域网内在线节点。
+
+```bash
+lan-share peers [OPTIONS]
+```
+
+选项：
+
+- `--bind-ip <IP>`：从指定网卡监听组播发现包。
+
+示例：
+
+```bash
+lan-share peers --bind-ip 192.168.1.5
+```
+
+### `send-text`
+
+发送文本消息。
+
+```bash
+lan-share send-text --to <TARGET> [OPTIONS] <TEXT>
+```
+
+选项：
+
+- `--to <TARGET>`：目标节点名、UUID、IP、`IP:Port` 或 IPv6。
+- `-n, --name <NAME>`：发送方名称，默认使用系统主机名或配置值。
+- `--bind-ip <IP>`：从指定网卡发现目标。
+
+示例：
+
+```bash
+lan-share send-text --to macbook "build finished"
+lan-share send-text --to 192.168.1.5:8080 --name ci "deploy ready"
+```
+
+### `send-file`
+
+发送单个文件。
+
+```bash
+lan-share send-file --to <TARGET> [OPTIONS] <FILE>
+```
+
+选项：
+
+- `--to <TARGET>`：目标节点名、UUID、IP、`IP:Port` 或 IPv6。
+- `-n, --name <NAME>`：发送方名称。
+- `--bind-ip <IP>`：从指定网卡发现目标。
+- `--retry <N>`：失败后重试次数，默认 `0`。
+- `--compress <auto|always|never>`：zstd 压缩策略，默认 `auto`。
+- `--progress[=true|false]`：显示上传进度，默认 `false`。
+- `--cancel-timeout <SECONDS>`：收到 Ctrl+C 后等待接收端清理的时间，默认 `10`。
+- `--chunked[=true|false]`：启用分片上传，默认 `false`。
+- `--chunk-size <BYTES>`：分片大小，默认 `8388608`。
+- `--chunk-concurrency <N>`：分片上传并发数，默认 `4`。
+- `--resume-upload-id <ID>`：继续指定 upload id 的分片上传。
+
+示例：
+
+```bash
+lan-share send-file --to macbook ./report.pdf
+lan-share send-file --to macbook --progress --retry 3 ./large.log
+lan-share send-file --to macbook --chunked --chunk-concurrency 4 ./video.mkv
+lan-share send-file --to 192.168.1.5:8080 --compress never ./archive.zip
+```
+
+分片上传开始时会输出 upload id。传输中断后，可使用该 id 尝试续传：
+
+```bash
+lan-share send-file --to macbook --chunked --resume-upload-id <UPLOAD_ID> ./video.mkv
+```
+
+### `send-files`
+
+并发发送多个文件。
+
+```bash
+lan-share send-files --to <TARGET> [OPTIONS] <FILES>...
+```
+
+除不支持 `--resume-upload-id` 外，传输选项与 `send-file` 基本一致，并额外支持：
+
+- `--concurrency <N>`：同时发送的文件数量，默认 `3`。
+
+示例：
+
+```bash
+lan-share send-files --to macbook --concurrency 2 ./a.zip ./b.zip ./c.zip
+```
+
+## 目标解析
+
+`--to` 支持以下形式：
+
+- 节点名：例如 `macbook`。
+- UUID：来自 `lan-share peers` 输出。
+- IPv4：例如 `192.168.1.5`，未写端口时默认补 `8080`。
+- IPv4 + 端口：例如 `192.168.1.5:9000`。
+- IPv6：例如 `[fe80::1]:8080`。
+
+如果目标是 IP 或 socket 地址，客户端会跳过组播扫描并直接连接。否则客户端会短暂监听组播发现结果，找到节点后选择可连通地址发送。
+
+## Web UI 行为
+
+Web UI 使用与 CLI 相同的接收服务和发送客户端。
+
+- 文本发送走当前节点代发到目标节点。
+- 文件发送会使用当前有效传输配置，包括 `retry`、`compress`、`chunked`、`chunk_size`、`chunk_concurrency` 和 `cancel_timeout`。
+- 群组发送会向当前发现的在线节点逐个发送。
+- 消息历史只保存在当前浏览器页面状态中，刷新页面后不会恢复历史。
+- 配置弹窗远程可读、本机可写；保存配置后部分字段需要重启服务才会生效。
+
+Web UI 受保护接口使用运行期 token 和同源请求信号，避免普通局域网客户端仅伪造 Fetch Metadata 头就驱动 Web 发送接口。能打开 Web UI 页面的用户仍可通过页面执行发送操作，这是 Web UI 的设计行为。
+
+## 配置
+
+配置优先级：
+
+```text
+CLI 参数 > 环境变量 > 配置文件 > 默认值
+```
+
+配置文件固定为：
+
+```text
+~/.config/lan-share/config.toml
+```
+
+示例：
 
 ```toml
 [defaults]
@@ -181,19 +271,32 @@ retry = 3
 compress = "auto"
 progress = true
 cancel_timeout = 10
-chunked = false
+chunked = true
 chunk_size = 8388608
 chunk_concurrency = 4
 concurrency = 3
 ```
 
-这些字段会作为对应 CLI 参数的默认值：`--dir`、`--port`、`--name`、`--bind-ip`、`--retry`、`--compress`、`--progress`、`--cancel-timeout`、`--chunked`、`--chunk-size`、`--chunk-concurrency`、`send-files --concurrency`。
+字段说明：
 
-路径值支持以 `~` 开头表示用户主目录，例如 `~/Downloads/LAN-Share`。该规则由 `lan-share` 自己处理，在 Windows、macOS 和 Linux 上都适用于配置文件、`LAN_SHARE_DIR`、带引号传入的 `--dir` 以及发送文件路径。
+| 字段 | 作用 | 默认值 |
+| --- | --- | --- |
+| `download_dir` | 接收文件保存目录 | `./downloads` |
+| `port` | HTTP 监听端口 | `8080` |
+| `name` | 节点名和默认发送方名称 | 系统主机名 |
+| `bind_ip` | 绑定的 IPv4 网卡地址 | 不指定 |
+| `retry` | 文件发送失败重试次数 | `0` |
+| `compress` | 文件压缩策略：`auto`、`always`、`never` | `auto` |
+| `progress` | CLI 文件发送进度条 | `false` |
+| `cancel_timeout` | Ctrl+C 后等待接收端清理的秒数 | `10` |
+| `chunked` | 是否启用分片上传 | `false` |
+| `chunk_size` | 分片大小，字节 | `8388608` |
+| `chunk_concurrency` | 分片上传并发数 | `4` |
+| `concurrency` | `send-files` 文件并发数 | `3` |
 
-以下参数不写入全局配置：`--to`、文字内容、文件路径、文件列表、`--resume-upload-id`。它们属于单次发送任务，应该每次在命令行指定。
+路径字段支持 `~`、`~/` 和 `~\` 开头，会解析为用户主目录。
 
-支持的环境变量：
+环境变量：
 
 ```bash
 LAN_SHARE_DIR=~/Downloads/LAN-Share
@@ -204,73 +307,92 @@ LAN_SHARE_RETRY=3
 LAN_SHARE_COMPRESS=auto
 LAN_SHARE_PROGRESS=true
 LAN_SHARE_CANCEL_TIMEOUT=10
-LAN_SHARE_CHUNKED=false
+LAN_SHARE_CHUNKED=true
 LAN_SHARE_CHUNK_SIZE=8388608
 LAN_SHARE_CHUNK_CONCURRENCY=4
 LAN_SHARE_CONCURRENCY=3
 ```
 
----
+以下内容不会写入全局配置，需要每次命令显式指定：
 
-## 💡 推荐使用方法 (最佳实践)
+- `--to`
+- 文本内容
+- 文件路径
+- 文件列表
+- `--resume-upload-id`
 
-### 1. 设备别名动态发送 (最常推荐)
-在局域网内设备 IP 经常变动的无线 Wi-Fi 环境下，建议在启动服务时为设备起一个固定的别名（例如 `--name archlinux`）。
-发送时，直接使用 `--to archlinux`：
+## 安全模型
+
+- 接收接口对局域网开放：`/api/message`、`/api/file`、`/api/file/init`、`/api/file/chunk/*`、`/api/file/complete/*`、`/api/file/cancel/*`。
+- 配置接口只允许本机访问：`/api/config`。
+- Web 发送接口需要 Web 页面运行期 token 和同源请求信号：`/api/runtime`、`/api/web/message`、`/api/web/file`。
+- 接收文件名会被净化为 basename，避免路径穿越。
+- 接收端使用 `create_new` 和重名递增策略避免覆盖已有文件。
+- 文件接收支持 SHA-256 校验，校验失败会清理临时文件。
+
+`lan-share` 面向可信局域网设计。不要把服务直接暴露到公网。
+
+## TUN 代理和多网卡
+
+开启 Clash、Sing-box 等 TUN 模式后，组播发现可能被虚拟网卡或路由策略影响。此时建议显式指定物理局域网 IP：
+
 ```bash
-lan-share send-file --to archlinux ~/movie.mp4
-```
-**为什么推荐**：
-*   无需记忆随时可能变化的 IP。
-*   **毫秒级极速解析**：客户端底层内置了“动态轮询与提前退出”机制。一旦组播心跳捕获到该别名对应的 IP，会**立刻终止扫描并进行发送**，通常仅需 `50ms - 200ms` 的解析延迟。
-
----
-
-### 2. IP:Port 直连绕过扫描 (0ms 延迟，适合自动化脚本)
-在已知对方物理地址（如 `192.168.100.155:8080` 或 `[::1]:8080`）的场景下，直接传递 `IP:Port` 作为参数。
-```bash
-lan-share send-file --to 192.168.100.155:8080 ~/movie.mp4
-```
-**为什么推荐**：
-*   **0ms 扫描时延**：程序检测到符合 `SocketAddr` 或 `IpAddr` 规范的直连地址时，将**完全跳过启动 UDP 监听和 2 秒扫描检测的过程**，直接建立 HTTP TCP 连接进行极速秒发。
-*   适合用于内网自动化脚本（如定时日志备份、编译产物分发）。
-
----
-
-### 3. 跨网卡多 IP 环境直连建议
-当节点存在多块网卡（如同时开启 Wi-Fi、以太网和虚拟机 VPN 网卡）时，组播心跳会把所有可用的本地单播 IP 汇总广播给发送端。
-发送端会自动提取最匹配的物理 IP。如果因特殊网络策略无法自动解析，您可以利用 `peers` 查看到的指定 IP 手动指定目标直连：
-```bash
-# peers 返回的 IPs 表里包含了多个地址，挑选能连通的地址直连
-lan-share send-text --to 192.168.100.155:8080 "Hello"
+lan-share web --bind-ip 192.168.1.5
+lan-share peers --bind-ip 192.168.1.5
+lan-share send-file --to macbook --bind-ip 192.168.1.5 ./movie.mkv
 ```
 
----
+如果 `peers` 能发现节点但发送失败，可以使用 `peers` 输出中的 `IP:Port` 直连：
 
-### 4. TUN 代理（Clash / Sing-box）下的设备发现与网卡绑定
-当你的设备开启了 TUN 模式的网络代理时，组播和广播包可能会被虚拟代理网卡拦截，导致无法在局域网内发现其他设备。
+```bash
+lan-share send-text --to 192.168.1.5:9000 "hello"
+```
 
-**解决方案**：在接收端和发送端都通过 `--bind-ip` 参数指定绑定到实际的局域网物理网卡 IP（例如 `192.168.1.5`），强制网络包通过物理网卡收发，从而绕过虚拟代理网卡。
+## 排障
 
-*   **接收端（serve）绑定**：
-    ```bash
-    lan-share serve --bind-ip 192.168.1.5
-    ```
-*   **扫描端（peers）绑定**：
-    ```bash
-    lan-share peers --bind-ip 192.168.1.5
-    ```
-*   **发送端（send-text / send-file）绑定**：
-    ```bash
-    lan-share send-file --to archlinux --bind-ip 192.168.1.5 ~/movie.mp4
-    ```
+### 扫描不到节点
 
----
+- 确认接收端正在运行 `serve` 或 `web`。
+- 检查防火墙是否允许 UDP `50001` 和对应 TCP 监听端口。
+- 多网卡或 TUN 代理环境下使用 `--bind-ip`。
+- 确认两台设备在同一局域网或组播可达网络内。
 
-## 🧪 自动化测试
+### 能发现节点但发送失败
 
-项目内嵌了完善的单元测试和端到端集成测试，支持对并发重名冲突、组播包多路分发进行模拟：
+- 使用 `lan-share peers` 查看目标实际端口。
+- 尝试使用 `IP:Port` 直连，排除名称解析和多 IP 选择问题。
+- 检查接收端端口是否被防火墙拦截。
+- 对大文件启用 `--retry`，必要时启用 `--chunked`。
+
+### Web 配置无法保存
+
+- 远程浏览器只能查看配置，不能保存配置。
+- 配置保存接口要求请求来源为 loopback。请让服务监听 loopback，并通过 `http://127.0.0.1:<PORT>` 或 `http://localhost:<PORT>` 打开后保存。
+- 如果 `web` 绑定到了局域网 IP，通过该局域网地址打开时仍会被视为非 loopback 访问；此时请直接编辑 `~/.config/lan-share/config.toml` 或用不指定 `--bind-ip` 的本机实例保存配置。
+- 保存后，端口、绑定 IP、节点名等运行参数需要重启服务才会生效。
+
+### 配置中的 `bind_ip` 不属于当前网卡
+
+`web` 模式下，如果配置文件中的 `bind_ip` 已不属于当前网卡且本次没有显式传 `--bind-ip`，程序会回退到默认绑定并打印提示。需要固定网卡时，请传入当前机器实际存在的局域网 IPv4。
+
+## 开发
+
+运行测试：
 
 ```bash
 cargo test
 ```
+
+格式化：
+
+```bash
+cargo fmt
+```
+
+常用开发启动：
+
+```bash
+cargo run -- web --port 0 --name dev-node
+```
+
+`--port 0` 会让系统分配空闲端口，适合本机多实例调试。
